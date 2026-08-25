@@ -17,6 +17,9 @@ impl Runtime {
     pub fn start(&self, _cx: &mut App) -> crate::Result<()> {
         Ok(())
     }
+
+    /// Does nothing.
+    pub fn shutdown(self) {}
 }
 
 /// Does nothing.

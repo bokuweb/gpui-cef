@@ -48,7 +48,7 @@ fn main() {
     });
 
     // 3. The message loop is done, so shut CEF down.
-    drop(runtime);
+    runtime.shutdown();
 }
 ```
 

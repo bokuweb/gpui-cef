@@ -124,6 +124,12 @@ impl Runtime {
 
         Ok(())
     }
+
+    /// Shuts CEF down. Call this once `gpui::Application::run` has returned.
+    ///
+    /// This drops one handle; `cef_shutdown()` runs when the last one goes, so
+    /// keeping a clone alive past this call keeps CEF alive too.
+    pub fn shutdown(self) {}
 }
 
 impl Drop for RuntimeInner {

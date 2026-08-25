@@ -38,6 +38,9 @@ impl Runtime {
     pub fn start(&self, _cx: &mut App) -> crate::Result<()> {
         Ok(())
     }
+
+    /// Does nothing: WebView2 needs no process-wide teardown.
+    pub fn shutdown(self) {}
 }
 
 /// Does nothing. Present so the same call sequence works on both platforms.

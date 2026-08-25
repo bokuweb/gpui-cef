@@ -550,7 +550,7 @@ fn main() {
     });
 
     // 3. run() returned, so the message loop is done: shut CEF down.
-    drop(runtime);
+    runtime.shutdown();
 }
 
 #[cfg(test)]
