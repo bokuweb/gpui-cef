@@ -74,8 +74,8 @@ impl Webview {
             .with_bounds(Rect {
                 position: LogicalPosition::new(0., 0.).into(),
                 size: LogicalSize::new(
-                    window.viewport_size().width.0 as f64,
-                    window.viewport_size().height.0 as f64,
+                    f32::from(window.viewport_size().width) as f64,
+                    f32::from(window.viewport_size().height) as f64,
                 )
                 .into(),
             });
@@ -189,9 +189,16 @@ impl Webview {
 
         let Some(webview) = &self.webview else { return };
         let _ = webview.set_bounds(Rect {
-            position: LogicalPosition::new(bounds.origin.x.0 as f64, bounds.origin.y.0 as f64)
-                .into(),
-            size: LogicalSize::new(bounds.size.width.0 as f64, bounds.size.height.0 as f64).into(),
+            position: LogicalPosition::new(
+                f32::from(bounds.origin.x) as f64,
+                f32::from(bounds.origin.y) as f64,
+            )
+            .into(),
+            size: LogicalSize::new(
+                f32::from(bounds.size.width) as f64,
+                f32::from(bounds.size.height) as f64,
+            )
+            .into(),
         });
     }
 }
