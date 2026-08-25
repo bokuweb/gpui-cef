@@ -1,5 +1,7 @@
 # gpui-cef
 
+[![CI](https://github.com/bokuweb/gpui-cef/actions/workflows/ci.yml/badge.svg)](https://github.com/bokuweb/gpui-cef/actions/workflows/ci.yml)
+
 Embed a real browser engine into [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
 | OS | Engine | How it is composited |
@@ -100,6 +102,32 @@ the BGRA that CEF's `OnPaint` returns is copied into a `RenderImage` and drawn w
 Making it zero-copy needs a BGRA branch in gpui — a pixel-format check in
 `paint_surface` plus a shader that draws BGRA as-is. Only set `accelerated: true`
 when running against a gpui that has one.
+
+## Known limitations
+
+- **Popups are not drawn.** `<select>` dropdowns and similar render into a
+  separate CEF layer (`PET_POPUP`) that this crate currently ignores, so they are
+  invisible. Compositing them means tracking `OnPopupSize` and drawing the popup
+  rect over the main frame.
+- **No IME.** Composition input (`SetComposition`) is not wired up, so typing
+  Japanese, Chinese, or Korean into a page will not work.
+- **No drag and drop** between the page and the rest of the application.
+- **The CPU copy path is the default.** See the section above.
+- The cursor the page asks for is forwarded to gpui, but CEF's custom cursors
+  (`CT_CUSTOM`) fall back to an arrow.
+
+## Testing
+
+```bash
+cargo test --workspace
+```
+
+The tests cover the pure parts: the gpui-to-CEF input translation, the shared
+state that decides when CEF has to be told about a resize, the cursor mapping,
+and the demo's URL handling. Anything that needs a live browser is exercised by
+running the demo instead — CEF's remote debugging port is open, so
+`http://127.0.0.1:9229/json/list` and CDP can be used to inspect what the page
+actually sees.
 
 ## Building
 
@@ -212,8 +240,13 @@ xtask/                  assembles the .app bundle
 
 ## Not verified
 
-- **The Windows backend has never been compiled.** It was written on macOS.
-- Real-world keyboard, scrolling, and resize behaviour. The code is there, untested.
+- **The Windows backend has never been run.** CI compiles and lints it on
+  Windows, but nobody has watched it draw anything.
+- Real-world keyboard and scrolling behaviour. The translation is unit tested,
+  but the round trip through CEF is not.
+- More than one webview at a time. The message pump is shared across them by
+  design, but only the single-webview case has been exercised.
 - How it looks. The development machine had no screen recording permission, so no
-  screenshot could capture the window. That frames reach gpui is confirmed through
-  the log.
+  screenshot could capture the window. That the page renders at exactly the
+  element's rect was confirmed over CDP instead (994x786 inside a 1280x860
+  window, matching the layout to the pixel).

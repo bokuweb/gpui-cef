@@ -81,7 +81,10 @@ impl BrowserWindow {
     }
 
     fn navigate(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let url = normalize_url(url);
+        let Some(url) = normalize_url(url) else {
+            // Nothing typed; leave the page alone rather than loading about:blank.
+            return;
+        };
         self.webview.read(cx).load_url(&url);
         self.editing_address = None;
         // Hand the keyboard back to the page.
@@ -416,16 +419,75 @@ impl Render for BrowserWindow {
     }
 }
 
-/// Adds a scheme when one is missing. Input without a `.` is treated as a search.
-fn normalize_url(input: &str) -> String {
+/// Turns what someone typed into a URL to load.
+///
+/// Returns `None` for input that should not navigate at all, so an accidental
+/// Enter on an empty address bar does not blank the page.
+fn normalize_url(input: &str) -> Option<String> {
     let trimmed = input.trim();
-    if trimmed.contains("://") || trimmed.starts_with("about:") {
-        trimmed.to_string()
-    } else if trimmed.contains('.') && !trimmed.contains(' ') {
-        format!("https://{trimmed}")
-    } else {
-        format!("https://duckduckgo.com/?q={}", urlencode(trimmed))
+    if trimmed.is_empty() {
+        return None;
     }
+
+    // Already a URL, including file:// and about:blank.
+    if trimmed.contains("://") || trimmed.starts_with("about:") {
+        return Some(trimmed.to_string());
+    }
+
+    if looks_like_a_host(trimmed) {
+        // Local development servers almost never speak https.
+        let scheme = if is_loopback(trimmed) {
+            "http"
+        } else {
+            "https"
+        };
+        return Some(format!("{scheme}://{trimmed}"));
+    }
+
+    Some(format!("https://duckduckgo.com/?q={}", urlencode(trimmed)))
+}
+
+/// Whether this looks like somewhere to connect to rather than something to
+/// search for.
+fn looks_like_a_host(input: &str) -> bool {
+    if input.contains(char::is_whitespace) {
+        return false;
+    }
+
+    let host = input
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = host.split(':').next().unwrap_or_default();
+
+    if host.is_empty() {
+        return false;
+    }
+    // "localhost" and "localhost:3000" have no dot but are still hosts.
+    if is_loopback(input) {
+        return true;
+    }
+    // Otherwise require a dotted name with a non-empty last label, so "3.5" is a
+    // host but "hello." and "1." are searches.
+    match host.rsplit_once('.') {
+        Some((before, tld)) => !before.is_empty() && !tld.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether the input points at this machine.
+fn is_loopback(input: &str) -> bool {
+    let host = input
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
 }
 
 /// Just enough percent-encoding to put a search term in a query string.
@@ -489,4 +551,82 @@ fn main() {
 
     // 3. run() returned, so the message loop is done: shut CEF down.
     drop(runtime);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_address_bar_does_not_navigate() {
+        assert_eq!(normalize_url(""), None);
+        assert_eq!(normalize_url("   "), None);
+    }
+
+    #[test]
+    fn existing_schemes_are_left_alone() {
+        assert_eq!(
+            normalize_url("https://example.com/a?b=c"),
+            Some("https://example.com/a?b=c".into())
+        );
+        assert_eq!(
+            normalize_url("file:///tmp/page.html"),
+            Some("file:///tmp/page.html".into())
+        );
+        assert_eq!(normalize_url("about:blank"), Some("about:blank".into()));
+    }
+
+    #[test]
+    fn bare_hosts_get_https() {
+        assert_eq!(
+            normalize_url("example.com"),
+            Some("https://example.com".into())
+        );
+        assert_eq!(
+            normalize_url("example.com:8080/path"),
+            Some("https://example.com:8080/path".into())
+        );
+        assert_eq!(
+            normalize_url("192.168.0.1"),
+            Some("https://192.168.0.1".into())
+        );
+    }
+
+    #[test]
+    fn local_development_servers_get_http() {
+        // A dev server on localhost almost never has a certificate.
+        assert_eq!(
+            normalize_url("localhost:3000"),
+            Some("http://localhost:3000".into())
+        );
+        assert_eq!(normalize_url("localhost"), Some("http://localhost".into()));
+        assert_eq!(
+            normalize_url("127.0.0.1:8080/health"),
+            Some("http://127.0.0.1:8080/health".into())
+        );
+    }
+
+    #[test]
+    fn everything_else_is_a_search() {
+        assert_eq!(
+            normalize_url("hello world"),
+            Some("https://duckduckgo.com/?q=hello+world".into())
+        );
+        // A trailing dot is a typo, not a host.
+        assert_eq!(
+            normalize_url("hello."),
+            Some("https://duckduckgo.com/?q=hello.".into())
+        );
+        assert_eq!(
+            normalize_url("rust"),
+            Some("https://duckduckgo.com/?q=rust".into())
+        );
+    }
+
+    #[test]
+    fn search_terms_are_percent_encoded() {
+        assert_eq!(urlencode("a b&c"), "a+b%26c");
+        // Multi-byte input has to be encoded per UTF-8 byte.
+        assert_eq!(urlencode("あ"), "%E3%81%82");
+    }
 }
