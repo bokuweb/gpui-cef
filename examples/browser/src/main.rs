@@ -263,6 +263,9 @@ impl BrowserWindow {
         div()
             .flex()
             .flex_col()
+            // Without flex_shrink_0 the panel gets squeezed: the webview element
+            // reports no intrinsic width, so the flex_1 sibling takes the space.
+            .flex_shrink_0()
             .gap_4()
             .w(px(260.))
             .h_full()
