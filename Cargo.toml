@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/gpui-cef", "examples/browser", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bokuweb/gpui-cef"
+
+[workspace.dependencies]
+# runtime_shaders: hand the shader source to Metal at runtime instead of
+# compiling it with `xcrun metal` at build time, which removes the need for a
+# full Xcode.app install.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+cef = "151"
+log = "0.4"
+parking_lot = "0.12"

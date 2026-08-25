@@ -1,0 +1,28 @@
+[package]
+name = "gpui-cef-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "gpui-cef-browser"
+path = "src/main.rs"
+
+[[bin]]
+name = "gpui-cef-browser_helper"
+path = "src/bin/helper.rs"
+
+[package.metadata.cef.bundle]
+helper_name = "gpui-cef-browser_helper"
+identifier = "dev.bokuweb.gpui-cef-browser"
+display-name = "gpui-cef browser"
+
+[dependencies]
+gpui-cef = { path = "../../crates/gpui-cef" }
+gpui.workspace = true
+log.workspace = true
+env_logger = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cef = { workspace = true, features = ["build-util"] }

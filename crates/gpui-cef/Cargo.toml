@@ -1,0 +1,28 @@
+[package]
+name = "gpui-cef"
+description = "Embed a real browser engine (Chromium/CEF on macOS, WebView2 on Windows) into gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cef.workspace = true
+image = "0.25"
+core-video = { version = "0.4.3", features = ["metal"] }
+io-surface = "0.16"
+objc2 = "0.6"
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wry = "0.56"
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
