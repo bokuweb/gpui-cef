@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all --check
+
+  macos:
+    name: macOS (CEF backend)
+    runs-on: macos-14
+    env:
+      # Where cef-dll-sys downloads the CEF binaries (~500MB), cached below.
+      CEF_PATH: ${{ github.workspace }}/.cef
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ninja
+        run: brew install ninja
+
+      # The download and the libcef_dll_wrapper build dominate the job, so keep
+      # the extracted distribution around between runs.
+      - name: Cache the CEF distribution
+        uses: actions/cache@v4
+        with:
+          path: .cef
+          key: cef-${{ runner.os }}-${{ runner.arch }}-151.3.24
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: rustup component add clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - name: Check rustdoc links
+        run: cargo doc -p gpui-cef --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # CEF locates its framework and helper processes through the bundle layout,
+      # so a bundle that fails to assemble means the demo cannot start at all.
+      - name: Build the .app bundle
+        run: cargo run -p xtask
+
+  windows:
+    name: Windows (WebView2 backend)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup component add clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
