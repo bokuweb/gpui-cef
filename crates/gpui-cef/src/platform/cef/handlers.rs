@@ -9,7 +9,7 @@ use std::rc::Rc;
 use cef::{rc::Rc as _, *};
 use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
-use gpui::RenderImage;
+use gpui::{CursorStyle, RenderImage};
 
 use super::shared::{Frame as SharedFrame, Shared};
 
@@ -223,6 +223,89 @@ wrap_display_handler! {
                 self.state.shared.set_url(url.to_string());
             }
         }
+
+        /// Off-screen rendering means CEF never touches the real cursor, so the
+        /// page's choice is forwarded to gpui instead.
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: *mut u8,
+            type_: CursorType,
+            _custom_cursor_info: Option<&CursorInfo>,
+        ) -> ::std::os::raw::c_int {
+            self.state.shared.set_cursor(cursor_style(type_));
+            // Returning 1 tells CEF the cursor has been dealt with.
+            1
+        }
+    }
+}
+
+/// Maps CEF's cursor kinds onto the closest thing gpui can show.
+fn cursor_style(cursor: CursorType) -> CursorStyle {
+    match cursor {
+        CursorType::HAND => CursorStyle::PointingHand,
+        CursorType::IBEAM => CursorStyle::IBeam,
+        CursorType::VERTICALTEXT => CursorStyle::IBeamCursorForVerticalLayout,
+        CursorType::CROSS | CursorType::CELL => CursorStyle::Crosshair,
+        CursorType::MOVE | CursorType::MIDDLEPANNING => CursorStyle::ClosedHand,
+        CursorType::GRAB => CursorStyle::OpenHand,
+        CursorType::GRABBING => CursorStyle::ClosedHand,
+        CursorType::CONTEXTMENU => CursorStyle::ContextualMenu,
+        CursorType::ALIAS | CursorType::DND_LINK => CursorStyle::DragLink,
+        CursorType::COPY | CursorType::DND_COPY => CursorStyle::DragCopy,
+        CursorType::NOTALLOWED | CursorType::NODROP | CursorType::DND_NONE => {
+            CursorStyle::OperationNotAllowed
+        }
+        CursorType::NONE => CursorStyle::None,
+        CursorType::EASTRESIZE | CursorType::WESTRESIZE => CursorStyle::ResizeLeftRight,
+        CursorType::NORTHRESIZE | CursorType::SOUTHRESIZE => CursorStyle::ResizeUpDown,
+        CursorType::EASTWESTRESIZE => CursorStyle::ResizeLeftRight,
+        CursorType::NORTHSOUTHRESIZE => CursorStyle::ResizeUpDown,
+        CursorType::NORTHEASTRESIZE | CursorType::SOUTHWESTRESIZE => {
+            CursorStyle::ResizeUpRightDownLeft
+        }
+        CursorType::NORTHWESTRESIZE | CursorType::SOUTHEASTRESIZE => {
+            CursorStyle::ResizeUpLeftDownRight
+        }
+        CursorType::NORTHEASTSOUTHWESTRESIZE => CursorStyle::ResizeUpRightDownLeft,
+        CursorType::NORTHWESTSOUTHEASTRESIZE => CursorStyle::ResizeUpLeftDownRight,
+        CursorType::COLUMNRESIZE => CursorStyle::ResizeColumn,
+        CursorType::ROWRESIZE => CursorStyle::ResizeRow,
+        // WAIT, PROGRESS, HELP, ZOOMIN/OUT and the panning cursors have no gpui
+        // equivalent; the arrow is the least surprising fallback.
+        _ => CursorStyle::Arrow,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_cursors_are_mapped() {
+        assert_eq!(cursor_style(CursorType::HAND), CursorStyle::PointingHand);
+        assert_eq!(cursor_style(CursorType::IBEAM), CursorStyle::IBeam);
+        assert_eq!(cursor_style(CursorType::POINTER), CursorStyle::Arrow);
+    }
+
+    #[test]
+    fn unmapped_cursors_fall_back_to_the_arrow() {
+        // No gpui equivalent, and guessing would be worse than an arrow.
+        assert_eq!(cursor_style(CursorType::WAIT), CursorStyle::Arrow);
+        assert_eq!(cursor_style(CursorType::ZOOMIN), CursorStyle::Arrow);
+    }
+
+    #[test]
+    fn opposite_resize_edges_share_a_cursor() {
+        // Left and right edges look the same, as they do everywhere else on macOS.
+        assert_eq!(
+            cursor_style(CursorType::EASTRESIZE),
+            cursor_style(CursorType::WESTRESIZE)
+        );
+        assert_eq!(
+            cursor_style(CursorType::NORTHRESIZE),
+            cursor_style(CursorType::SOUTHRESIZE)
+        );
     }
 }
 

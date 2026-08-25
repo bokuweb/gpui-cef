@@ -12,7 +12,7 @@ use std::{
 };
 
 use cef::{Browser, BrowserHost, ImplBrowser};
-use gpui::{px, size, Bounds, Pixels, RenderImage, Size};
+use gpui::{px, size, Bounds, CursorStyle, Pixels, RenderImage, Size};
 
 /// The most recent frame handed over by CEF.
 pub(crate) enum Frame {
@@ -49,6 +49,8 @@ pub(crate) struct Shared {
     /// Whether history navigation is possible.
     can_go_back: Cell<bool>,
     can_go_forward: Cell<bool>,
+    /// The cursor the page wants, as reported by CEF's `OnCursorChange`.
+    cursor: Cell<CursorStyle>,
     /// Whether the first frame has arrived, purely so the log can confirm the
     /// pipeline is alive.
     received_frame: Cell<bool>,
@@ -73,6 +75,7 @@ impl Shared {
             is_loading: Cell::new(false),
             can_go_back: Cell::new(false),
             can_go_forward: Cell::new(false),
+            cursor: Cell::new(CursorStyle::Arrow),
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
         })
@@ -195,11 +198,155 @@ impl Shared {
         self.can_go_forward.get()
     }
 
+    pub(crate) fn set_cursor(&self, cursor: CursorStyle) {
+        if self.cursor.replace(cursor) != cursor {
+            // The cursor is applied while painting, so a repaint has to happen.
+            self.dirty.set(true);
+        }
+    }
+
+    pub(crate) fn cursor(&self) -> CursorStyle {
+        self.cursor.get()
+    }
+
     pub(crate) fn title(&self) -> String {
         self.title.borrow().clone()
     }
 
     pub(crate) fn url(&self) -> String {
         self.url.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, Bounds};
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(w), px(h)),
+        }
+    }
+
+    #[test]
+    fn first_layout_is_a_resize() {
+        let shared = Shared::new("about:blank".into());
+        shared.set_layout(bounds(0., 0., 640., 480.), 1.);
+
+        assert!(shared.take_resized());
+        assert_eq!(shared.view_size(), size(px(640.), px(480.)));
+        // Taking it clears it.
+        assert!(!shared.take_resized());
+    }
+
+    #[test]
+    fn sub_pixel_jitter_does_not_resize() {
+        let shared = Shared::new("about:blank".into());
+        shared.set_layout(bounds(0., 0., 640., 480.), 1.);
+        assert!(shared.take_resized());
+
+        // Layout rounding must not make us call was_resized() every frame.
+        shared.set_layout(bounds(0., 0., 640.4, 480.4), 1.);
+        assert!(!shared.take_resized());
+
+        shared.set_layout(bounds(0., 0., 642., 480.), 1.);
+        assert!(shared.take_resized());
+    }
+
+    #[test]
+    fn moving_without_resizing_updates_bounds_only() {
+        let shared = Shared::new("about:blank".into());
+        shared.set_layout(bounds(0., 0., 640., 480.), 1.);
+        assert!(shared.take_resized());
+
+        // Scrolling the webview around should not re-lay-out the page.
+        shared.set_layout(bounds(100., 50., 640., 480.), 1.);
+        assert!(!shared.take_resized());
+        assert_eq!(shared.bounds().origin, point(px(100.), px(50.)));
+    }
+
+    #[test]
+    fn scale_factor_change_is_a_resize() {
+        let shared = Shared::new("about:blank".into());
+        shared.set_layout(bounds(0., 0., 640., 480.), 1.);
+        assert!(shared.take_resized());
+
+        // Dragging the window to a Retina display has to reach CEF.
+        shared.set_layout(bounds(0., 0., 640., 480.), 2.);
+        assert!(shared.take_resized());
+        assert_eq!(shared.scale_factor(), 2.);
+    }
+
+    #[test]
+    fn zero_sized_layout_is_clamped() {
+        let shared = Shared::new("about:blank".into());
+        // A collapsed element must not ask CEF for a zero-sized view.
+        shared.set_layout(bounds(0., 0., 0., 0.), 1.);
+
+        assert_eq!(shared.view_size(), size(px(1.), px(1.)));
+    }
+
+    #[test]
+    fn cursor_only_dirties_on_change() {
+        let shared = Shared::new("about:blank".into());
+        shared.take_dirty();
+
+        shared.set_cursor(CursorStyle::PointingHand);
+        assert!(shared.take_dirty());
+        assert_eq!(shared.cursor(), CursorStyle::PointingHand);
+
+        // CEF reports the cursor on every move; repeats must not force repaints.
+        shared.set_cursor(CursorStyle::PointingHand);
+        assert!(!shared.take_dirty());
+    }
+
+    #[test]
+    fn title_and_url_track_the_page() {
+        let shared = Shared::new("https://example.com/".into());
+        assert_eq!(shared.url(), "https://example.com/");
+        assert_eq!(shared.title(), "");
+
+        shared.set_title("Example".into());
+        shared.set_url("https://example.com/next".into());
+        assert_eq!(shared.title(), "Example");
+        assert_eq!(shared.url(), "https://example.com/next");
+        assert!(shared.take_dirty());
+    }
+
+    #[test]
+    fn load_state_round_trips() {
+        let shared = Shared::new("about:blank".into());
+        assert!(!shared.is_loading());
+        assert!(!shared.can_go_back());
+
+        shared.set_load_state(true, true, false);
+        assert!(shared.is_loading());
+        assert!(shared.can_go_back());
+        assert!(!shared.can_go_forward());
+        assert!(shared.take_dirty());
+    }
+
+    #[test]
+    fn replacing_a_cpu_frame_hands_back_the_old_one() {
+        let shared = Shared::new("about:blank".into());
+        let first = cpu_frame(2, 2);
+        let second = cpu_frame(2, 2);
+
+        shared.put_frame(Frame::Cpu(first.clone()));
+        // Nothing to release yet: gpui never saw a previous frame.
+        assert!(shared.take_stale_cpu_frame().is_none());
+
+        shared.put_frame(Frame::Cpu(second));
+        // The old texture has to come back so it can leave gpui's cache.
+        let stale = shared.take_stale_cpu_frame().expect("stale frame");
+        assert!(Arc::ptr_eq(&stale, &first));
+        assert!(shared.take_stale_cpu_frame().is_none());
+    }
+
+    fn cpu_frame(width: u32, height: u32) -> Arc<RenderImage> {
+        let buffer = image::ImageBuffer::from_pixel(width, height, image::Rgba([0u8, 0, 0, 255]));
+        Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
     }
 }

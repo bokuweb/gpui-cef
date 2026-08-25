@@ -21,6 +21,7 @@ mod shared;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use cef::{
@@ -30,10 +31,10 @@ use cef::{
 };
 use gpui::{
     div, point, px, relative, surface, AnyElement, App, Bounds, Context, Element, ElementId,
-    Focusable, GlobalElementId, ImageSource, InspectorElementId, InteractiveElement, IntoElement,
-    KeyDownEvent, KeyUpEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, Style, Styled,
-    StyledImage, Window,
+    Focusable, GlobalElementId, Hitbox, HitboxBehavior, ImageSource, InspectorElementId,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Render,
+    ScrollDelta, ScrollWheelEvent, Style, Styled, StyledImage, Window,
 };
 
 use self::shared::{Frame, Shared};
@@ -141,6 +142,13 @@ impl Drop for RuntimeInner {
 /// `Frameworks/Chromium Embedded Framework.framework` — the layout `xtask`
 /// produces.
 pub fn init(options: RuntimeOptions) -> crate::Result<Runtime> {
+    // Loading the framework and running execute_process twice is not something
+    // CEF expects, and the failure mode is a confusing crash much later.
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    if INITIALIZED.swap(true, Ordering::SeqCst) {
+        return Err(Error::Backend("gpui_cef::init() called twice".into()));
+    }
+
     let exe = std::env::current_exe().map_err(|e| Error::LibraryLoad(e.to_string()))?;
     let loader = LibraryLoader::new(&exe, false);
     if !loader.load() {
@@ -185,7 +193,7 @@ pub struct Webview {
     shared: Rc<Shared>,
     browser: Option<Browser>,
     focus_handle: gpui::FocusHandle,
-    _pump: pump::Pump,
+    _pump: pump::Registration,
 }
 
 impl Webview {
@@ -237,7 +245,7 @@ impl Webview {
             None => log::error!("cef_browser_host_create_browser_sync() returned null"),
         }
 
-        let pump = pump::Pump::start(
+        let pump = pump::register(
             shared.clone(),
             accelerated,
             cx.entity().downgrade(),
@@ -463,7 +471,8 @@ impl WebviewSurface {
 
 impl Element for WebviewSurface {
     type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = ();
+    /// The hitbox the page's cursor choice is attached to.
+    type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -503,11 +512,12 @@ impl Element for WebviewSurface {
         child: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Hitbox {
         self.shared.set_layout(bounds, window.scale_factor());
         if let Some(child) = child.as_mut() {
             child.prepaint(window, cx);
         }
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
 
     fn paint(
@@ -516,13 +526,16 @@ impl Element for WebviewSurface {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         child: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
+        hitbox: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(child) = child.as_mut() {
             child.paint(window, cx);
         }
+        // Off-screen rendering means CEF never sets the real cursor, so whatever
+        // the page asked for is applied here.
+        window.set_cursor_style(self.shared.cursor(), hitbox);
     }
 }
 
