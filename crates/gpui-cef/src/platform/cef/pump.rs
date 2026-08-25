@@ -186,17 +186,17 @@ fn tick_view(view: &View) {
         }
     }
 
-    let stale = view.shared.take_stale_cpu_frame();
+    let stale = view.shared.take_stale_cpu_frames();
     let dirty = view.shared.take_dirty();
-    if stale.is_none() && !dirty {
+    if stale.is_empty() && !dirty {
         return;
     }
 
     let mut cx = view.cx.clone();
     let _ = view.webview.update(&mut cx, |_, cx| {
-        // Release the texture the CPU path is done with.
-        if let Some(stale) = stale {
-            cx.drop_image(stale, None);
+        // Release the textures the CPU path is done with.
+        for frame in stale {
+            cx.drop_image(frame, None);
         }
         if dirty {
             cx.notify();

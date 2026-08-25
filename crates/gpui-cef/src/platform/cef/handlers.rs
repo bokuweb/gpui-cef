@@ -9,7 +9,7 @@ use std::rc::Rc;
 use cef::{rc::Rc as _, *};
 use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
-use gpui::{CursorStyle, RenderImage};
+use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
 use super::shared::{Frame as SharedFrame, Shared};
 
@@ -116,6 +116,22 @@ wrap_render_handler! {
             1
         }
 
+        /// Whether the popup layer — a `<select>` dropdown and the like — is on
+        /// screen. CEF draws it as a separate layer, so it has to be composited
+        /// over the page rather than ignored.
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: ::std::os::raw::c_int) {
+            self.state.shared.set_popup_visible(show != 0);
+        }
+
+        /// Where the popup goes, in the webview's own coordinate space.
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            let Some(rect) = rect else { return };
+            self.state.shared.set_popup_rect(Bounds {
+                origin: gpui::point(px(rect.x as f32), px(rect.y as f32)),
+                size: size(px(rect.width as f32), px(rect.height as f32)),
+            });
+        }
+
         /// The GPU path: take the shared IOSurface CEF drew into and wrap it in a
         /// `CVPixelBuffer`, ready for gpui's `surface()`. No pixels are copied.
         fn on_accelerated_paint(
@@ -125,10 +141,6 @@ wrap_render_handler! {
             _dirty_rects: Option<&[Rect]>,
             info: Option<&AcceleratedPaintInfo>,
         ) {
-            // Popups (a <select> dropdown, say) are not drawn yet.
-            if type_ != PaintElementType::default() {
-                return;
-            }
             let Some(info) = info else { return };
             if info.shared_texture_io_surface.is_null() {
                 return;
@@ -149,10 +161,14 @@ wrap_render_handler! {
             };
 
             match CVPixelBuffer::from_io_surface(&surface, None) {
-                Ok(buffer) => self
-                    .state
-                    .shared
-                    .put_frame(SharedFrame::Accelerated(buffer)),
+                Ok(buffer) => {
+                    let frame = SharedFrame::Accelerated(buffer);
+                    if type_ == PaintElementType::POPUP {
+                        self.state.shared.put_popup_frame(frame);
+                    } else {
+                        self.state.shared.put_frame(frame);
+                    }
+                }
                 Err(status) => {
                     log::error!("CVPixelBufferCreateWithIOSurface failed: {status}");
                 }
@@ -170,9 +186,6 @@ wrap_render_handler! {
             width: ::std::os::raw::c_int,
             height: ::std::os::raw::c_int,
         ) {
-            if type_ != PaintElementType::default() {
-                return;
-            }
             if buffer.is_null() || width <= 0 || height <= 0 {
                 return;
             }
@@ -185,12 +198,14 @@ wrap_render_handler! {
             else {
                 return;
             };
-            let frame = image::Frame::new(image);
-            self.state
-                .shared
-                .put_frame(SharedFrame::Cpu(std::sync::Arc::new(RenderImage::new(
-                    vec![frame],
-                ))));
+            let frame = SharedFrame::Cpu(std::sync::Arc::new(RenderImage::new(vec![
+                image::Frame::new(image),
+            ])));
+            if type_ == PaintElementType::POPUP {
+                self.state.shared.put_popup_frame(frame);
+            } else {
+                self.state.shared.put_frame(frame);
+            }
         }
     }
 }

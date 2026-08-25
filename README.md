@@ -105,10 +105,6 @@ when running against a gpui that has one.
 
 ## Known limitations
 
-- **Popups are not drawn.** `<select>` dropdowns and similar render into a
-  separate CEF layer (`PET_POPUP`) that this crate currently ignores, so they are
-  invisible. Compositing them means tracking `OnPopupSize` and drawing the popup
-  rect over the main frame.
 - **No IME.** Composition input (`SetComposition`) is not wired up, so typing
   Japanese, Chinese, or Korean into a page will not work.
 - **No drag and drop** between the page and the rest of the application.
@@ -123,11 +119,15 @@ cargo test --workspace
 ```
 
 The tests cover the pure parts: the gpui-to-CEF input translation, the shared
-state that decides when CEF has to be told about a resize, the cursor mapping,
-and the demo's URL handling. Anything that needs a live browser is exercised by
-running the demo instead — CEF's remote debugging port is open, so
-`http://127.0.0.1:9229/json/list` and CDP can be used to inspect what the page
-actually sees.
+state that decides when CEF has to be told about a resize, the popup layer
+bookkeeping, the cursor mapping, and the demo's URL handling.
+
+Anything that needs a live browser is exercised by running the demo instead.
+CEF's remote debugging port is open, so `http://127.0.0.1:9229/json/list` plus
+CDP can drive and inspect the page without looking at the screen — useful both in
+a headless environment and for checking things that are hard to eyeball. That is
+how the layout rect (994x786 inside a 1280x860 window) and the `<select>` popup
+were verified.
 
 ## Building
 

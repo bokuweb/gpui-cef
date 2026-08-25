@@ -194,6 +194,7 @@ pub struct Webview {
     browser: Option<Browser>,
     focus_handle: gpui::FocusHandle,
     _pump: pump::Registration,
+    _focus_subscriptions: [gpui::Subscription; 2],
 }
 
 impl Webview {
@@ -252,11 +253,30 @@ impl Webview {
             cx.to_async(),
         );
 
+        // CEF has to be told when focus moves, or a caret keeps blinking in the
+        // page after the user clicks something else in the app.
+        let focus_handle = cx.focus_handle();
+        let focus_subscriptions = [
+            cx.on_focus_in(&focus_handle, window, |this, _, _| {
+                this.set_browser_focus(true)
+            }),
+            cx.on_focus_out(&focus_handle, window, |this, _, _, _| {
+                this.set_browser_focus(false)
+            }),
+        ];
+
         Self {
             shared,
             browser,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _pump: pump,
+            _focus_subscriptions: focus_subscriptions,
+        }
+    }
+
+    fn set_browser_focus(&self, focused: bool) {
+        if let Some(host) = self.host() {
+            host.set_focus(focused as i32);
         }
     }
 
@@ -411,10 +431,8 @@ impl Render for Webview {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    // Focusing raises on_focus_in, which is what tells CEF.
                     window.focus(&this.focus_handle);
-                    if let Some(host) = this.host() {
-                        host.set_focus(1);
-                    }
                     this.send_mouse_down(event);
                 }),
             )
@@ -452,20 +470,46 @@ struct WebviewSurface {
 
 impl WebviewSurface {
     fn build_child(&self) -> Option<AnyElement> {
-        self.shared.with_frame(|frame| match frame? {
-            Frame::Accelerated(buffer) => Some(
-                surface(buffer.clone())
-                    .object_fit(ObjectFit::Fill)
-                    .size_full()
-                    .into_any_element(),
-            ),
-            Frame::Cpu(image) => Some(
-                gpui::img(ImageSource::Render(image.clone()))
-                    .object_fit(ObjectFit::Fill)
-                    .size_full()
-                    .into_any_element(),
-            ),
+        let page = self.shared.with_frame(|frame| frame.map(frame_element))?;
+
+        // CEF paints `<select>` dropdowns and similar into a separate layer with
+        // its own rect, so they have to be composited over the page here.
+        let popup = self.shared.with_popup(|popup| {
+            popup.map(|(frame, rect)| {
+                div()
+                    .absolute()
+                    .left(rect.origin.x)
+                    .top(rect.origin.y)
+                    .w(rect.size.width)
+                    .h(rect.size.height)
+                    .child(frame_element(frame))
+                    .into_any_element()
+            })
+        });
+
+        Some(match popup {
+            Some(popup) => div()
+                .relative()
+                .size_full()
+                .child(page)
+                .child(popup)
+                .into_any_element(),
+            None => page,
         })
+    }
+}
+
+/// Draws one CEF layer, whichever way its frame arrived.
+fn frame_element(frame: &Frame) -> AnyElement {
+    match frame {
+        Frame::Accelerated(buffer) => surface(buffer.clone())
+            .object_fit(ObjectFit::Fill)
+            .size_full()
+            .into_any_element(),
+        Frame::Cpu(image) => gpui::img(ImageSource::Render(image.clone()))
+            .object_fit(ObjectFit::Fill)
+            .size_full()
+            .into_any_element(),
     }
 }
 

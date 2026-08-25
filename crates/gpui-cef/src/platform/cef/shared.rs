@@ -22,6 +22,35 @@ pub(crate) enum Frame {
     Cpu(Arc<RenderImage>),
 }
 
+/// One layer's worth of frame bookkeeping. CEF paints the page and any popup
+/// (a `<select>` dropdown, say) as separate layers, and each needs the same
+/// "latest frame plus the texture gpui should now release" handling.
+#[derive(Default)]
+struct FrameSlot {
+    frame: RefCell<Option<Frame>>,
+    stale_cpu: RefCell<Option<Arc<RenderImage>>>,
+}
+
+impl FrameSlot {
+    fn put(&self, frame: Frame) {
+        // If the outgoing frame was a CPU one, it has to be dropped from gpui's
+        // texture cache, so remember it.
+        if let Some(Frame::Cpu(old)) = self.frame.replace(Some(frame)) {
+            *self.stale_cpu.borrow_mut() = Some(old);
+        }
+    }
+
+    fn clear(&self) {
+        if let Some(Frame::Cpu(old)) = self.frame.replace(None) {
+            *self.stale_cpu.borrow_mut() = Some(old);
+        }
+    }
+
+    fn take_stale(&self) -> Option<Arc<RenderImage>> {
+        self.stale_cpu.borrow_mut().take()
+    }
+}
+
 /// Shared state for one webview.
 pub(crate) struct Shared {
     /// The rect gpui laid this out at, in window space. Used to translate mouse
@@ -31,11 +60,12 @@ pub(crate) struct Shared {
     view_size: Cell<Size<Pixels>>,
     /// The scale factor reported by `RenderHandler::get_screen_info`.
     scale_factor: Cell<f32>,
-    /// The latest frame.
-    frame: RefCell<Option<Frame>>,
-    /// The previous CPU frame handed to gpui, kept so it can be dropped from
-    /// gpui's texture cache.
-    stale_cpu_frame: RefCell<Option<Arc<RenderImage>>>,
+    /// The latest frame of the page itself.
+    view: FrameSlot,
+    /// The latest frame of the popup layer, and where to draw it.
+    popup: FrameSlot,
+    popup_visible: Cell<bool>,
+    popup_rect: Cell<Bounds<Pixels>>,
     /// Set when a new frame arrives; the pump picks this up and calls `notify()`.
     dirty: Cell<bool>,
     /// Set when `view_size` changed; the pump picks this up and calls
@@ -66,8 +96,10 @@ impl Shared {
             // CEF rejects a zero-sized view, so start out non-zero.
             view_size: Cell::new(size(px(800.), px(600.))),
             scale_factor: Cell::new(1.),
-            frame: RefCell::new(None),
-            stale_cpu_frame: RefCell::new(None),
+            view: FrameSlot::default(),
+            popup: FrameSlot::default(),
+            popup_visible: Cell::new(false),
+            popup_rect: Cell::new(Bounds::default()),
             dirty: Cell::new(false),
             resized: Cell::new(false),
             title: RefCell::new(String::new()),
@@ -144,21 +176,58 @@ impl Shared {
             }
         }
 
-        // If the outgoing frame was a CPU one, it has to be dropped from gpui's
-        // texture cache, so remember it.
-        if let Some(Frame::Cpu(old)) = self.frame.replace(Some(frame)) {
-            *self.stale_cpu_frame.borrow_mut() = Some(old);
+        self.view.put(frame);
+        self.dirty.set(true);
+    }
+
+    /// The popup layer CEF paints for `<select>` dropdowns and the like.
+    pub(crate) fn put_popup_frame(&self, frame: Frame) {
+        log::debug!("popup frame");
+        self.popup.put(frame);
+        self.dirty.set(true);
+    }
+
+    pub(crate) fn set_popup_visible(&self, visible: bool) {
+        log::debug!("popup {}", if visible { "shown" } else { "hidden" });
+        self.popup_visible.set(visible);
+        if !visible {
+            // Keeping the last frame around would leave a ghost dropdown behind.
+            self.popup.clear();
         }
         self.dirty.set(true);
     }
 
-    pub(crate) fn with_frame<R>(&self, f: impl FnOnce(Option<&Frame>) -> R) -> R {
-        f(self.frame.borrow().as_ref())
+    /// Where the popup goes, in the webview's own coordinate space.
+    pub(crate) fn set_popup_rect(&self, rect: Bounds<Pixels>) {
+        log::debug!("popup rect {rect:?}");
+        self.popup_rect.set(rect);
+        self.dirty.set(true);
     }
 
-    /// Takes the stale frame that gpui should release from its texture cache.
-    pub(crate) fn take_stale_cpu_frame(&self) -> Option<Arc<RenderImage>> {
-        self.stale_cpu_frame.borrow_mut().take()
+    pub(crate) fn with_frame<R>(&self, f: impl FnOnce(Option<&Frame>) -> R) -> R {
+        f(self.view.frame.borrow().as_ref())
+    }
+
+    /// Runs `f` with the popup frame and its rect, but only while it is showing.
+    pub(crate) fn with_popup<R>(&self, f: impl FnOnce(Option<(&Frame, Bounds<Pixels>)>) -> R) -> R {
+        if !self.popup_visible.get() {
+            return f(None);
+        }
+        let rect = self.popup_rect.get();
+        f(self
+            .popup
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|frame| (frame, rect)))
+    }
+
+    /// Takes the stale frames that gpui should release from its texture cache.
+    pub(crate) fn take_stale_cpu_frames(&self) -> Vec<Arc<RenderImage>> {
+        [self.view.take_stale(), self.popup.take_stale()]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     pub(crate) fn take_dirty(&self) -> bool {
@@ -336,13 +405,47 @@ mod tests {
 
         shared.put_frame(Frame::Cpu(first.clone()));
         // Nothing to release yet: gpui never saw a previous frame.
-        assert!(shared.take_stale_cpu_frame().is_none());
+        assert!(shared.take_stale_cpu_frames().is_empty());
 
         shared.put_frame(Frame::Cpu(second));
         // The old texture has to come back so it can leave gpui's cache.
-        let stale = shared.take_stale_cpu_frame().expect("stale frame");
-        assert!(Arc::ptr_eq(&stale, &first));
-        assert!(shared.take_stale_cpu_frame().is_none());
+        let stale = shared.take_stale_cpu_frames();
+        assert_eq!(stale.len(), 1);
+        assert!(Arc::ptr_eq(&stale[0], &first));
+        assert!(shared.take_stale_cpu_frames().is_empty());
+    }
+
+    #[test]
+    fn the_popup_is_only_drawn_while_it_is_showing() {
+        let shared = Shared::new("about:blank".into());
+        shared.put_popup_frame(Frame::Cpu(cpu_frame(4, 4)));
+        shared.set_popup_rect(bounds(10., 20., 100., 200.));
+
+        // CEF paints the popup layer before it announces it, so a frame alone
+        // must not put a stray dropdown on screen.
+        assert!(shared.with_popup(|popup| popup.is_none()));
+
+        shared.set_popup_visible(true);
+        let rect = shared.with_popup(|popup| popup.map(|(_, rect)| rect));
+        assert_eq!(rect, Some(bounds(10., 20., 100., 200.)));
+    }
+
+    #[test]
+    fn hiding_the_popup_releases_its_texture() {
+        let shared = Shared::new("about:blank".into());
+        let frame = cpu_frame(4, 4);
+        shared.put_popup_frame(Frame::Cpu(frame.clone()));
+        shared.set_popup_visible(true);
+        shared.take_stale_cpu_frames();
+
+        shared.set_popup_visible(false);
+
+        // Otherwise the dropdown would stay on screen after it closed, and its
+        // texture would leak in gpui's cache.
+        assert!(shared.with_popup(|popup| popup.is_none()));
+        let stale = shared.take_stale_cpu_frames();
+        assert_eq!(stale.len(), 1);
+        assert!(Arc::ptr_eq(&stale[0], &frame));
     }
 
     fn cpu_frame(width: u32, height: u32) -> Arc<RenderImage> {
