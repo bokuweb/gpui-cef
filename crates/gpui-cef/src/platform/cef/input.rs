@@ -78,34 +78,18 @@ fn new_key_event(type_: KeyEventType, modifier_flags: u32) -> KeyEvent {
     }
 }
 
-/// Builds the events to send to CEF for a key press.
+/// The physical key press.
 ///
-/// CEF expects two stages: RAWKEYDOWN for the physical key, then CHAR for the
-/// text it produced. Keys that type nothing (arrows, Escape) get no CHAR.
-pub(crate) fn key_down_events(keystroke: &gpui::Keystroke) -> Vec<KeyEvent> {
-    let flags = modifiers(&keystroke.modifiers);
+/// Only RAWKEYDOWN is sent. CEF's other half — CHAR, carrying the text the key
+/// produced — is deliberately not sent from here: text reaches the page through
+/// the input handler in [`super::ime`], which is the only path that also works
+/// for input methods. Sending both would insert every character twice.
+pub(crate) fn key_down_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     let vk = windows_key_code(&keystroke.key);
-    let mut events = Vec::with_capacity(2);
-
-    let mut raw = new_key_event(KeyEventType::RAWKEYDOWN, flags);
-    raw.windows_key_code = vk;
-    raw.native_key_code = vk;
-    events.push(raw);
-
-    // Modifier-only presses and command shortcuts do not produce text.
-    if !keystroke.modifiers.control && !keystroke.modifiers.platform {
-        if let Some(text) = keystroke.key_char.as_deref() {
-            for unit in text.encode_utf16() {
-                let mut char_event = new_key_event(KeyEventType::CHAR, flags);
-                char_event.windows_key_code = unit as i32;
-                char_event.character = unit;
-                char_event.unmodified_character = unit;
-                events.push(char_event);
-            }
-        }
-    }
-
-    events
+    let mut event = new_key_event(KeyEventType::RAWKEYDOWN, modifiers(&keystroke.modifiers));
+    event.windows_key_code = vk;
+    event.native_key_code = vk;
+    event
 }
 
 /// The matching key release event.
@@ -235,19 +219,19 @@ mod tests {
     }
 
     #[test]
-    fn typing_sends_a_raw_key_and_a_char() {
-        let events = key_down_events(&keystroke("a", Some("a"), Modifiers::default()));
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].type_, KeyEventType::RAWKEYDOWN);
-        assert_eq!(events[0].windows_key_code, 'A' as i32);
-        assert_eq!(events[1].type_, KeyEventType::CHAR);
-        assert_eq!(events[1].character, 'a' as u16);
+    fn a_key_press_sends_only_the_physical_key() {
+        // The character itself goes through the input handler, so emitting CHAR
+        // here as well would insert everything twice.
+        let event = key_down_event(&keystroke("a", Some("a"), Modifiers::default()));
+        assert_eq!(event.type_, KeyEventType::RAWKEYDOWN);
+        assert_eq!(event.windows_key_code, 'A' as i32);
+        assert_eq!(event.character, 0);
     }
 
     #[test]
-    fn shortcuts_do_not_type_text() {
-        // Cmd-A selects all; it must not also insert an "a" into the page.
-        let events = key_down_events(&keystroke(
+    fn shortcuts_keep_their_modifiers() {
+        // Cmd-A has to reach the page as a shortcut, not as text.
+        let event = key_down_event(&keystroke(
             "a",
             Some("a"),
             Modifiers {
@@ -255,32 +239,26 @@ mod tests {
                 ..Default::default()
             },
         ));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].type_, KeyEventType::RAWKEYDOWN);
+        assert_eq!(
+            event.modifiers & EVENTFLAG_COMMAND_DOWN,
+            EVENTFLAG_COMMAND_DOWN
+        );
     }
 
     #[test]
-    fn keys_without_text_send_no_char() {
-        let events = key_down_events(&keystroke("left", None, Modifiers::default()));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].windows_key_code, 0x25);
-    }
-
-    #[test]
-    fn astral_characters_become_a_surrogate_pair() {
-        // CEF's KeyEvent::character is a single UTF-16 unit, so an emoji needs two.
-        let events = key_down_events(&keystroke("u", Some("\u{1F600}"), Modifiers::default()));
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[1].character, 0xD83D);
-        assert_eq!(events[2].character, 0xDE00);
+    fn keys_without_text_still_reach_the_page() {
+        let event = key_down_event(&keystroke("left", None, Modifiers::default()));
+        assert_eq!(event.windows_key_code, 0x25);
     }
 
     #[test]
     fn key_events_carry_their_size() {
         // CEF rejects the event outright when size is left at zero.
-        let events = key_down_events(&keystroke("a", Some("a"), Modifiers::default()));
         let expected = std::mem::size_of::<cef::sys::_cef_key_event_t>();
-        assert!(events.iter().all(|event| event.size == expected));
+        assert_eq!(
+            key_down_event(&keystroke("a", Some("a"), Modifiers::default())).size,
+            expected
+        );
         assert_eq!(
             key_up_event(&keystroke("a", Some("a"), Modifiers::default())).size,
             expected

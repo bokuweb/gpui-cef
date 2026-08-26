@@ -81,6 +81,12 @@ pub(crate) struct Shared {
     can_go_forward: Cell<bool>,
     /// The cursor the page wants, as reported by CEF's `OnCursorChange`.
     cursor: Cell<CursorStyle>,
+    /// The text the OS IME is currently composing. The page owns the real text;
+    /// this mirror exists only so the IME has something coherent to ask about.
+    composition: RefCell<String>,
+    /// Where CEF says the composition is on screen, in the webview's own
+    /// coordinate space. Used to place the candidate window.
+    composition_bounds: RefCell<Vec<Bounds<Pixels>>>,
     /// Whether the first frame has arrived, purely so the log can confirm the
     /// pipeline is alive.
     received_frame: Cell<bool>,
@@ -108,6 +114,8 @@ impl Shared {
             can_go_back: Cell::new(false),
             can_go_forward: Cell::new(false),
             cursor: Cell::new(CursorStyle::Arrow),
+            composition: RefCell::new(String::new()),
+            composition_bounds: RefCell::new(Vec::new()),
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
         })
@@ -276,6 +284,39 @@ impl Shared {
 
     pub(crate) fn cursor(&self) -> CursorStyle {
         self.cursor.get()
+    }
+
+    /// Records the text the IME is composing, or clears it when `text` is empty.
+    pub(crate) fn set_composition(&self, text: &str) {
+        let mut composition = self.composition.borrow_mut();
+        composition.clear();
+        composition.push_str(text);
+    }
+
+    pub(crate) fn composition(&self) -> String {
+        self.composition.borrow().clone()
+    }
+
+    /// The per-character rects CEF reports through `OnImeCompositionRangeChanged`.
+    pub(crate) fn set_composition_bounds(&self, bounds: Vec<Bounds<Pixels>>) {
+        *self.composition_bounds.borrow_mut() = bounds;
+    }
+
+    /// The rect covering `range` of the composition, in the webview's own
+    /// coordinate space. Falls back to the whole composition when the range is
+    /// out of step with what CEF last reported.
+    pub(crate) fn composition_bounds(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        let bounds = self.composition_bounds.borrow();
+        let slice = bounds.get(range).filter(|slice| !slice.is_empty());
+        let slice = match slice {
+            Some(slice) => slice,
+            None if !bounds.is_empty() => &bounds[..],
+            None => return None,
+        };
+        slice.iter().copied().reduce(|acc, rect| acc.union(&rect))
     }
 
     pub(crate) fn title(&self) -> String {

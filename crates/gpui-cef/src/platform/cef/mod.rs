@@ -13,6 +13,7 @@
 //!    run loop; see [`pump`] for why it cannot live on gpui's executor.
 
 mod handlers;
+mod ime;
 mod input;
 mod nsapp;
 mod pump;
@@ -399,9 +400,11 @@ impl Webview {
 
     fn send_key_down(&self, event: &KeyDownEvent) {
         let Some(host) = self.host() else { return };
-        for cef_event in input::key_down_events(&event.keystroke) {
-            host.send_key_event(Some(&cef_event));
-        }
+        // Only the physical key goes through here. The text it produces arrives
+        // via the input handler in [`ime`], which is also the only path that
+        // works for anything needing composition. Sending CHAR as well would
+        // insert every character twice.
+        host.send_key_event(Some(&input::key_down_event(&event.keystroke)));
     }
 
     fn send_key_up(&self, event: &KeyUpEvent) {
@@ -461,6 +464,8 @@ impl Render for Webview {
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.send_key_up(event)))
             .child(WebviewSurface {
                 shared: self.shared.clone(),
+                webview: cx.entity(),
+                focus_handle: self.focus_handle.clone(),
             })
     }
 }
@@ -472,6 +477,8 @@ impl Render for Webview {
 /// - translating window-space mouse positions into view space
 struct WebviewSurface {
     shared: Rc<Shared>,
+    webview: gpui::Entity<Webview>,
+    focus_handle: gpui::FocusHandle,
 }
 
 impl WebviewSurface {
@@ -574,7 +581,7 @@ impl Element for WebviewSurface {
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         child: &mut Self::RequestLayoutState,
         hitbox: &mut Self::PrepaintState,
         window: &mut Window,
@@ -586,6 +593,14 @@ impl Element for WebviewSurface {
         // Off-screen rendering means CEF never sets the real cursor, so whatever
         // the page asked for is applied here.
         window.set_cursor_style(self.shared.cursor(), hitbox);
+
+        // Registers the page as the window's text input target, which is what
+        // lets the OS input method compose into it. See [`ime`].
+        window.handle_input(
+            &self.focus_handle,
+            gpui::ElementInputHandler::new(bounds, self.webview.clone()),
+            cx,
+        );
     }
 }
 
