@@ -297,10 +297,6 @@ impl Shared {
         self.composition.borrow().clone()
     }
 
-    pub(crate) fn is_composing(&self) -> bool {
-        !self.composition.borrow().is_empty()
-    }
-
     /// The per-character rects CEF reports through `OnImeCompositionRangeChanged`.
     pub(crate) fn set_composition_bounds(&self, bounds: Vec<Bounds<Pixels>>) {
         *self.composition_bounds.borrow_mut() = bounds;
