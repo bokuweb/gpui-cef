@@ -116,6 +116,25 @@ wrap_render_handler! {
             1
         }
 
+        /// Where the text being composed sits on screen. macOS needs this to put
+        /// the IME candidate window next to the caret rather than in the corner.
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            _selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            let bounds = character_bounds
+                .unwrap_or_default()
+                .iter()
+                .map(|rect| Bounds {
+                    origin: gpui::point(px(rect.x as f32), px(rect.y as f32)),
+                    size: size(px(rect.width as f32), px(rect.height as f32)),
+                })
+                .collect();
+            self.state.shared.set_composition_bounds(bounds);
+        }
+
         /// Whether the popup layer — a `<select>` dropdown and the like — is on
         /// screen. CEF draws it as a separate layer, so it has to be composited
         /// over the page rather than ignored.

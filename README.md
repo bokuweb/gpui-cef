@@ -95,6 +95,11 @@ It stops at the last step on stock gpui. `surface()` hard-codes NV12
 through a YUV-to-RGB shader — it was written for Zed's screen sharing. CEF produces
 BGRA, so passing it straight through trips an `assert_eq!` in `metal_renderer.rs`.
 
+Measured cost of that copy, at 994x786 in a debug build: **1.2% CPU across all
+processes when the page is idle, ~38% while the page repaints continuously at
+60fps**. An application UI is idle almost all the time, so the copy rarely shows
+up; a page running constant animation is where it does.
+
 So the **default is the CPU copy path** (`WebviewOptions::accelerated == false`):
 the BGRA that CEF's `OnPaint` returns is copied into a `RenderImage` and drawn with
 `img()`. That is roughly 3.9MB per frame at 1200x820.
@@ -105,12 +110,32 @@ when running against a gpui that has one.
 
 ## Known limitations
 
-- **No IME.** Composition input (`SetComposition`) is not wired up, so typing
-  Japanese, Chinese, or Korean into a page will not work.
 - **No drag and drop** between the page and the rest of the application.
 - **The CPU copy path is the default.** See the section above.
 - The cursor the page asks for is forwarded to gpui, but CEF's custom cursors
   (`CT_CUSTOM`) fall back to an arrow.
+- Input methods are wired up (see below) but the live round trip has not been
+  confirmed by a human at a keyboard.
+
+## Text input and input methods
+
+Off-screen rendering leaves CEF with no window for the OS to attach an input
+context to, so Chromium never sees the input method on its own. Sending key
+events alone gets you ASCII and nothing else — Japanese, Chinese, Korean and
+dead-key accents all arrive as *composition*, which the OS negotiates with the
+focused view instead of delivering as keystrokes.
+
+`platform/cef/ime.rs` implements gpui's `EntityInputHandler` against CEF's
+`ImeSetComposition` / `ImeCommitText` / `ImeCancelComposition`, and uses the
+rects from `OnImeCompositionRangeChanged` to place the candidate window. That
+trait is written for an editor that owns its text, which this does not — but the
+OS only ever asks about the text it is currently composing, and a mirror of just
+that much is enough.
+
+One consequence: `RAWKEYDOWN` is the only key event sent to CEF. The text a key
+produces arrives through the input handler instead, because that is the only path
+that also works for composition. Sending CEF's `CHAR` event as well would insert
+every character twice.
 
 ## Testing
 
@@ -242,8 +267,11 @@ xtask/                  assembles the .app bundle
 
 - **The Windows backend has never been run.** CI compiles and lints it on
   Windows, but nobody has watched it draw anything.
-- Real-world keyboard and scrolling behaviour. The translation is unit tested,
-  but the round trip through CEF is not.
+- **Typing.** The input-method wiring is unit tested for its offset arithmetic
+  only. Synthesizing real key events needs macOS Accessibility permission, which
+  the development machine does not have, so the round trip from keyboard to page
+  has to be confirmed by hand.
+- Scrolling direction and step size through CEF.
 - More than one webview at a time. The message pump is shared across them by
   design, but only the single-webview case has been exercised.
 - How it looks. The development machine had no screen recording permission, so no
