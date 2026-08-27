@@ -22,41 +22,65 @@
 
 use std::ops::Range;
 
-use cef::{ImplBrowserHost, Range as CefRange};
+use cef::{CompositionUnderline, ImplBrowserHost, Range as CefRange};
 use gpui::{Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window};
 
 use super::Webview;
 
 impl Webview {
-    /// Sends the text the IME has settled on, and forgets the composition.
-    fn commit(&self, text: &str, replacement: Option<Range<usize>>) {
-        self.shared.set_composition("");
+    /// Sends text after AppKit has finished its current input-client callback.
+    fn commit_now(&self, text: &str, was_composing: bool, pending_key: Option<&gpui::Keystroke>) {
+        super::input_trace(format_args!(
+            "commit_now text={text:?} was_composing={was_composing} pending_key={pending_key:?}"
+        ));
         if let Some(host) = self.host() {
-            host.ime_commit_text(
-                Some(&text.into()),
-                replacement.map(cef_range).as_ref(),
-                // Relative to the end of the inserted text, which is where every
-                // caller here wants the caret.
-                0,
-            );
+            if was_composing {
+                // The ranges AppKit gives gpui refer to our small composition
+                // mirror, not to the page's document. CEF already owns the real
+                // selection, so an absent replacement range commits at its caret.
+                let replacement_range = invalid_cef_range();
+                host.ime_commit_text(Some(&text.into()), Some(&replacement_range), 0);
+            } else {
+                // ImeCommitText completes an existing composition; it is not
+                // Chromium's general text insertion API. Plain text therefore
+                // travels as CHAR events after AppKit accepts it.
+                if let Some(keystroke) = pending_key {
+                    host.send_key_event(Some(&super::input::key_down_event(keystroke)));
+                }
+                for event in super::input::text_events(text) {
+                    host.send_key_event(Some(&event));
+                }
+            }
         }
     }
 
     /// Sends the in-progress composition so the page can show it underlined.
-    fn compose(
-        &self,
-        text: &str,
-        replacement: Option<Range<usize>>,
-        selection: Option<Range<usize>>,
-    ) {
-        self.shared.set_composition(text);
+    fn compose_now(&self, text: &str, selection: Option<Range<usize>>) {
+        super::input_trace(format_args!(
+            "compose_now text={text:?} selection={selection:?}"
+        ));
         if let Some(host) = self.host() {
+            // Match cefclient's macOS OSR implementation. Even when AppKit
+            // supplies an un-attributed string it creates a default underline
+            // spanning the whole composition instead of passing a null list.
+            let underlines = [CompositionUnderline {
+                range: CefRange {
+                    from: 0,
+                    to: utf16_len(text) as u32,
+                },
+                color: 0xff00_0000,
+                ..Default::default()
+            }];
+            // AppKit reports NSNotFound when no document range should be
+            // replaced. cefclient preserves that as UINT_MAX rather than a
+            // null pointer, which is significant to Chromium's macOS path.
+            let replacement_range = invalid_cef_range();
             host.ime_set_composition(
                 Some(&text.into()),
-                // Passing no underlines lets Chromium apply its own, which is
-                // what a page would get from a normal browser.
-                None,
-                replacement.map(cef_range).as_ref(),
+                Some(&underlines),
+                // GPUI's range is relative to the mirrored composition and
+                // cannot be used as a document range in Chromium.
+                Some(&replacement_range),
                 selection.map(cef_range).as_ref(),
             );
         }
@@ -73,11 +97,8 @@ impl EntityInputHandler for Webview {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        super::input_trace(format_args!("text_for_range range={range:?}"));
         let composition = self.shared.composition();
-        if composition.is_empty() {
-            return None;
-        }
-
         let length = utf16_len(&composition);
         let clamped = range.start.min(length)..range.end.min(length);
         if clamped != range {
@@ -96,6 +117,7 @@ impl EntityInputHandler for Webview {
         // one at the end of the composition is enough for the IME to proceed, and
         // returning None would make macOS treat the view as not accepting text.
         let caret = utf16_len(&self.shared.composition());
+        super::input_trace(format_args!("selected_text_range caret={caret}"));
         Some(UTF16Selection {
             range: caret..caret,
             reversed: false,
@@ -108,42 +130,76 @@ impl EntityInputHandler for Webview {
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         let length = utf16_len(&self.shared.composition());
+        super::input_trace(format_args!("marked_text_range length={length}"));
         (length > 0).then_some(0..length)
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::input_trace("unmark_text");
         self.shared.set_composition("");
-        if let Some(host) = self.host() {
-            host.ime_cancel_composition();
-        }
+        self.pending_printable_key = None;
+        cx.defer_in(window, |this, _, _| {
+            if let Some(host) = this.host() {
+                host.ime_finish_composing_text(0);
+            }
+        });
     }
 
     /// Committed text: what the IME decided on, or a plain typed character.
     fn replace_text_in_range(
         &mut self,
-        range: Option<Range<usize>>,
+        _range: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        self.commit(text, range);
+        let was_composing = !self.shared.composition().is_empty();
+        super::input_trace(format_args!(
+            "replace_text text={text:?} range={_range:?} was_composing={was_composing}"
+        ));
+        self.shared.set_composition("");
+        let pending_key = if was_composing {
+            None
+        } else {
+            self.pending_printable_key.take()
+        };
+        self.pending_printable_key = None;
+        let text = text.to_owned();
+        cx.defer_in(window, move |this, _, _| {
+            this.commit_now(&text, was_composing, pending_key.as_ref())
+        });
     }
 
     /// Text still being composed, e.g. the kana before conversion.
     fn replace_and_mark_text_in_range(
         &mut self,
-        range: Option<Range<usize>>,
+        _range: Option<Range<usize>>,
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
+        super::input_trace(format_args!(
+            "set_marked_text text={new_text:?} range={_range:?} selection={new_selected_range:?}"
+        ));
         if new_text.is_empty() {
-            // An empty composition means the IME gave up on it.
-            self.unmark_text(_window, _cx);
+            // Input methods use an empty marked string to cancel, which is
+            // distinct from NSTextInputClient::unmarkText (finish and keep).
+            self.shared.set_composition("");
+            self.pending_printable_key = None;
+            cx.defer_in(window, |this, _, _| {
+                if let Some(host) = this.host() {
+                    host.ime_cancel_composition();
+                }
+            });
             return;
         }
-        self.compose(new_text, range, new_selected_range);
+        self.shared.set_composition(new_text);
+        self.pending_printable_key = None;
+        let text = new_text.to_owned();
+        cx.defer_in(window, move |this, _, _| {
+            this.compose_now(&text, new_selected_range)
+        });
     }
 
     /// Where to put the candidate window. CEF reports the composition rects in
@@ -155,6 +211,7 @@ impl EntityInputHandler for Webview {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        super::input_trace(format_args!("bounds_for_range range={range_utf16:?}"));
         let mut bounds = self.shared.composition_bounds(range_utf16)?;
         bounds.origin += element_bounds.origin;
         Some(bounds)
@@ -176,6 +233,13 @@ fn cef_range(range: Range<usize>) -> CefRange {
     CefRange {
         from: range.start as u32,
         to: range.end as u32,
+    }
+}
+
+fn invalid_cef_range() -> CefRange {
+    CefRange {
+        from: u32::MAX,
+        to: u32::MAX,
     }
 }
 
@@ -211,6 +275,13 @@ mod tests {
     }
 
     #[test]
+    fn invalid_range_matches_cef_macos_ns_not_found() {
+        let range = invalid_cef_range();
+        assert_eq!(range.from, u32::MAX);
+        assert_eq!(range.to, u32::MAX);
+    }
+
+    #[test]
     fn out_of_range_slices_clamp_instead_of_panicking() {
         // The OS can ask about a range that no longer exists after a fast edit.
         assert_eq!(utf16_slice("abc", 1..99), "bc");
@@ -223,11 +294,5 @@ mod tests {
         // Splitting a surrogate pair is invalid UTF-16; lossy conversion keeps
         // this from taking the process down.
         assert_eq!(utf16_slice("\u{1F600}", 0..1).chars().count(), 1);
-    }
-
-    #[test]
-    fn ranges_convert_to_cef_ranges() {
-        let range = cef_range(2..5);
-        assert_eq!((range.from, range.to), (2, 5));
     }
 }

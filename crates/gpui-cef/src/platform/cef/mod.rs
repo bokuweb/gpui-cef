@@ -25,6 +25,12 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) fn input_trace(message: impl std::fmt::Display) {
+    if std::env::var_os("GPUI_CEF_INPUT_TRACE").is_some() {
+        eprintln!("[gpui-cef-input] {message}");
+    }
+}
+
 use cef::{
     args::Args, browser_host_create_browser_sync, execute_process, initialize,
     library_loader::LibraryLoader, Browser, BrowserHost, BrowserSettings, ImplBrowser,
@@ -200,6 +206,10 @@ pub struct Webview {
     shared: Rc<Shared>,
     browser: Option<Browser>,
     focus_handle: gpui::FocusHandle,
+    /// Printable keys reach GPUI before AppKit asks the input client what text
+    /// they produce. Hold one until `insertText` or `setMarkedText` decides
+    /// whether this is ordinary text or IME composition.
+    pending_printable_key: Option<gpui::Keystroke>,
     _pump: pump::Registration,
     _focus_subscriptions: [gpui::Subscription; 2],
 }
@@ -265,9 +275,11 @@ impl Webview {
         let focus_handle = cx.focus_handle();
         let focus_subscriptions = [
             cx.on_focus_in(&focus_handle, window, |this, _, _| {
+                input_trace("focus in");
                 this.set_browser_focus(true)
             }),
             cx.on_focus_out(&focus_handle, window, |this, _, _, _| {
+                input_trace("focus out");
                 this.set_browser_focus(false)
             }),
         ];
@@ -276,6 +288,7 @@ impl Webview {
             shared,
             browser,
             focus_handle,
+            pending_printable_key: None,
             _pump: pump,
             _focus_subscriptions: focus_subscriptions,
         }
@@ -398,16 +411,28 @@ impl Webview {
         host.send_mouse_wheel_event(Some(&cef_event), dx.round() as i32, dy.round() as i32);
     }
 
-    fn send_key_down(&self, event: &KeyDownEvent) {
-        let Some(host) = self.host() else { return };
-        // Only the physical key goes through here. The text it produces arrives
-        // via the input handler in [`ime`], which is also the only path that
-        // works for anything needing composition. Sending CHAR as well would
-        // insert every character twice.
-        host.send_key_event(Some(&input::key_down_event(&event.keystroke)));
+    fn send_key_down(&mut self, event: &KeyDownEvent, _window: &Window, _cx: &mut Context<Self>) {
+        let keystroke = event.keystroke.clone();
+        input_trace(format_args!(
+            "key down key={:?} char={:?} modifiers={:?}",
+            keystroke.key, keystroke.key_char, keystroke.modifiers
+        ));
+        let modifiers = keystroke.modifiers;
+        let is_printable_text = keystroke.key_char.is_some()
+            && !modifiers.control
+            && !modifiers.platform
+            && !modifiers.function;
+        if is_printable_text {
+            input_trace("printable raw key held for AppKit text decision");
+            self.pending_printable_key = Some(keystroke);
+        } else if let Some(host) = self.host() {
+            input_trace("non-printable raw key sent to CEF");
+            host.send_key_event(Some(&input::key_down_event(&keystroke)));
+        }
     }
 
     fn send_key_up(&self, event: &KeyUpEvent) {
+        input_trace(format_args!("key up key={:?}", event.keystroke.key));
         let Some(host) = self.host() else { return };
         host.send_key_event(Some(&input::key_up_event(&event.keystroke)));
     }
@@ -460,7 +485,9 @@ impl Render for Webview {
             .on_scroll_wheel(
                 cx.listener(|this, event: &ScrollWheelEvent, _, _| this.send_scroll(event)),
             )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| this.send_key_down(event)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.send_key_down(event, window, cx)
+            }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.send_key_up(event)))
             .child(WebviewSurface {
                 shared: self.shared.clone(),
