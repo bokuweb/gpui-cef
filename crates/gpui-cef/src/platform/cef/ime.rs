@@ -74,6 +74,7 @@ impl EntityInputHandler for Webview {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        super::input_trace(format_args!("text_for_range range={range:?}"));
         let composition = self.shared.composition();
         let length = utf16_len(&composition);
         let clamped = range.start.min(length)..range.end.min(length);
@@ -93,6 +94,7 @@ impl EntityInputHandler for Webview {
         // one at the end of the composition is enough for the IME to proceed, and
         // returning None would make macOS treat the view as not accepting text.
         let caret = utf16_len(&self.shared.composition());
+        super::input_trace(format_args!("selected_text_range caret={caret}"));
         Some(UTF16Selection {
             range: caret..caret,
             reversed: false,
@@ -105,10 +107,12 @@ impl EntityInputHandler for Webview {
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         let length = utf16_len(&self.shared.composition());
+        super::input_trace(format_args!("marked_text_range length={length}"));
         (length > 0).then_some(0..length)
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::input_trace("unmark_text");
         self.shared.set_composition("");
         self.ime_handled_key = true;
         cx.defer_in(window, |this, _, _| {
@@ -127,6 +131,9 @@ impl EntityInputHandler for Webview {
         cx: &mut Context<Self>,
     ) {
         let was_composing = !self.shared.composition().is_empty();
+        super::input_trace(format_args!(
+            "replace_text text={text:?} range={_range:?} was_composing={was_composing}"
+        ));
         self.shared.set_composition("");
         if was_composing {
             self.ime_handled_key = true;
@@ -146,6 +153,9 @@ impl EntityInputHandler for Webview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace(format_args!(
+            "set_marked_text text={new_text:?} range={_range:?} selection={new_selected_range:?}"
+        ));
         if new_text.is_empty() {
             // Input methods use an empty marked string to cancel, which is
             // distinct from NSTextInputClient::unmarkText (finish and keep).
@@ -175,6 +185,7 @@ impl EntityInputHandler for Webview {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        super::input_trace(format_args!("bounds_for_range range={range_utf16:?}"));
         let mut bounds = self.shared.composition_bounds(range_utf16)?;
         bounds.origin += element_bounds.origin;
         Some(bounds)

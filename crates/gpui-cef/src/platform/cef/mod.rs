@@ -25,6 +25,12 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) fn input_trace(message: impl std::fmt::Display) {
+    if std::env::var_os("GPUI_CEF_INPUT_TRACE").is_some() {
+        eprintln!("[gpui-cef-input] {message}");
+    }
+}
+
 use cef::{
     args::Args, browser_host_create_browser_sync, execute_process, initialize,
     library_loader::LibraryLoader, Browser, BrowserHost, BrowserSettings, ImplBrowser,
@@ -268,9 +274,11 @@ impl Webview {
         let focus_handle = cx.focus_handle();
         let focus_subscriptions = [
             cx.on_focus_in(&focus_handle, window, |this, _, _| {
+                input_trace("focus in");
                 this.set_browser_focus(true)
             }),
             cx.on_focus_out(&focus_handle, window, |this, _, _, _| {
+                input_trace("focus out");
                 this.set_browser_focus(false)
             }),
         ];
@@ -404,14 +412,20 @@ impl Webview {
 
     fn send_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let keystroke = event.keystroke.clone();
+        input_trace(format_args!(
+            "key down key={:?} char={:?} modifiers={:?}",
+            keystroke.key, keystroke.key_char, keystroke.modifiers
+        ));
         // CEF's macOS OSR client waits until NSTextInputClient has processed
         // the native event. This avoids sending the underlying Roman key when
         // the input method produced marked text instead.
         cx.defer_in(window, move |this, _, _| {
             if this.ime_handled_key {
+                input_trace("deferred raw key suppressed by IME");
                 this.ime_handled_key = false;
                 return;
             }
+            input_trace("deferred raw key sent to CEF");
             if let Some(host) = this.host() {
                 host.send_key_event(Some(&input::key_down_event(&keystroke)));
             }
@@ -419,6 +433,7 @@ impl Webview {
     }
 
     fn send_key_up(&self, event: &KeyUpEvent) {
+        input_trace(format_args!("key up key={:?}", event.keystroke.key));
         let Some(host) = self.host() else { return };
         host.send_key_event(Some(&input::key_up_event(&event.keystroke)));
     }
