@@ -29,7 +29,10 @@ use super::Webview;
 
 impl Webview {
     /// Sends text after AppKit has finished its current input-client callback.
-    fn commit_now(&self, text: &str, was_composing: bool) {
+    fn commit_now(&self, text: &str, was_composing: bool, pending_key: Option<&gpui::Keystroke>) {
+        super::input_trace(format_args!(
+            "commit_now text={text:?} was_composing={was_composing} pending_key={pending_key:?}"
+        ));
         if let Some(host) = self.host() {
             if was_composing {
                 // The ranges AppKit gives gpui refer to our small composition
@@ -40,6 +43,9 @@ impl Webview {
                 // ImeCommitText completes an existing composition; it is not
                 // Chromium's general text insertion API. Plain text therefore
                 // travels as CHAR events after AppKit accepts it.
+                if let Some(keystroke) = pending_key {
+                    host.send_key_event(Some(&super::input::key_down_event(keystroke)));
+                }
                 for event in super::input::text_events(text) {
                     host.send_key_event(Some(&event));
                 }
@@ -49,6 +55,9 @@ impl Webview {
 
     /// Sends the in-progress composition so the page can show it underlined.
     fn compose_now(&self, text: &str, selection: Option<Range<usize>>) {
+        super::input_trace(format_args!(
+            "compose_now text={text:?} selection={selection:?}"
+        ));
         if let Some(host) = self.host() {
             host.ime_set_composition(
                 Some(&text.into()),
@@ -114,7 +123,7 @@ impl EntityInputHandler for Webview {
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         super::input_trace("unmark_text");
         self.shared.set_composition("");
-        self.ime_handled_key = true;
+        self.pending_printable_key = None;
         cx.defer_in(window, |this, _, _| {
             if let Some(host) = this.host() {
                 host.ime_finish_composing_text(0);
@@ -135,12 +144,15 @@ impl EntityInputHandler for Webview {
             "replace_text text={text:?} range={_range:?} was_composing={was_composing}"
         ));
         self.shared.set_composition("");
-        if was_composing {
-            self.ime_handled_key = true;
-        }
+        let pending_key = if was_composing {
+            None
+        } else {
+            self.pending_printable_key.take()
+        };
+        self.pending_printable_key = None;
         let text = text.to_owned();
         cx.defer_in(window, move |this, _, _| {
-            this.commit_now(&text, was_composing)
+            this.commit_now(&text, was_composing, pending_key.as_ref())
         });
     }
 
@@ -160,7 +172,7 @@ impl EntityInputHandler for Webview {
             // Input methods use an empty marked string to cancel, which is
             // distinct from NSTextInputClient::unmarkText (finish and keep).
             self.shared.set_composition("");
-            self.ime_handled_key = true;
+            self.pending_printable_key = None;
             cx.defer_in(window, |this, _, _| {
                 if let Some(host) = this.host() {
                     host.ime_cancel_composition();
@@ -169,7 +181,7 @@ impl EntityInputHandler for Webview {
             return;
         }
         self.shared.set_composition(new_text);
-        self.ime_handled_key = true;
+        self.pending_printable_key = None;
         let text = new_text.to_owned();
         cx.defer_in(window, move |this, _, _| {
             this.compose_now(&text, new_selected_range)

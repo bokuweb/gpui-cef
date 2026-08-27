@@ -206,9 +206,10 @@ pub struct Webview {
     shared: Rc<Shared>,
     browser: Option<Browser>,
     focus_handle: gpui::FocusHandle,
-    /// Set when AppKit consumes the current key as marked text. Key dispatch
-    /// is deferred until that decision is available.
-    ime_handled_key: bool,
+    /// Printable keys reach GPUI before AppKit asks the input client what text
+    /// they produce. Hold one until `insertText` or `setMarkedText` decides
+    /// whether this is ordinary text or IME composition.
+    pending_printable_key: Option<gpui::Keystroke>,
     _pump: pump::Registration,
     _focus_subscriptions: [gpui::Subscription; 2],
 }
@@ -287,7 +288,7 @@ impl Webview {
             shared,
             browser,
             focus_handle,
-            ime_handled_key: false,
+            pending_printable_key: None,
             _pump: pump,
             _focus_subscriptions: focus_subscriptions,
         }
@@ -410,26 +411,24 @@ impl Webview {
         host.send_mouse_wheel_event(Some(&cef_event), dx.round() as i32, dy.round() as i32);
     }
 
-    fn send_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn send_key_down(&mut self, event: &KeyDownEvent, _window: &Window, _cx: &mut Context<Self>) {
         let keystroke = event.keystroke.clone();
         input_trace(format_args!(
             "key down key={:?} char={:?} modifiers={:?}",
             keystroke.key, keystroke.key_char, keystroke.modifiers
         ));
-        // CEF's macOS OSR client waits until NSTextInputClient has processed
-        // the native event. This avoids sending the underlying Roman key when
-        // the input method produced marked text instead.
-        cx.defer_in(window, move |this, _, _| {
-            if this.ime_handled_key {
-                input_trace("deferred raw key suppressed by IME");
-                this.ime_handled_key = false;
-                return;
-            }
-            input_trace("deferred raw key sent to CEF");
-            if let Some(host) = this.host() {
-                host.send_key_event(Some(&input::key_down_event(&keystroke)));
-            }
-        });
+        let modifiers = keystroke.modifiers;
+        let is_printable_text = keystroke.key_char.is_some()
+            && !modifiers.control
+            && !modifiers.platform
+            && !modifiers.function;
+        if is_printable_text {
+            input_trace("printable raw key held for AppKit text decision");
+            self.pending_printable_key = Some(keystroke);
+        } else if let Some(host) = self.host() {
+            input_trace("non-printable raw key sent to CEF");
+            host.send_key_event(Some(&input::key_down_event(&keystroke)));
+        }
     }
 
     fn send_key_up(&self, event: &KeyUpEvent) {
