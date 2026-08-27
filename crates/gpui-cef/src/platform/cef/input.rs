@@ -80,16 +80,38 @@ fn new_key_event(type_: KeyEventType, modifier_flags: u32) -> KeyEvent {
 
 /// The physical key press.
 ///
-/// Only RAWKEYDOWN is sent. CEF's other half — CHAR, carrying the text the key
-/// produced — is deliberately not sent from here: text reaches the page through
-/// the input handler in [`super::ime`], which is the only path that also works
-/// for input methods. Sending both would insert every character twice.
 pub(crate) fn key_down_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     let vk = windows_key_code(&keystroke.key);
     let mut event = new_key_event(KeyEventType::RAWKEYDOWN, modifiers(&keystroke.modifiers));
     event.windows_key_code = vk;
-    event.native_key_code = vk;
+    event.native_key_code = native_key_code(&keystroke.key, vk);
+    event.character = first_utf16(keystroke.key_char.as_deref().unwrap_or_default());
+    event.unmodified_character = first_utf16(&keystroke.key);
     event
+}
+
+/// Character input committed by the platform text input client.
+///
+/// CEF does not derive text from `RAWKEYDOWN` for a windowless browser. GPUI's
+/// input handler calls this only after AppKit has decided the keystroke is text,
+/// so shortcuts never become accidental character input.
+pub(crate) fn text_events(text: &str) -> Vec<KeyEvent> {
+    text.encode_utf16()
+        .map(|character| {
+            // AppKit reports Return as LF, while Chromium's keyboard path uses
+            // CR for the corresponding CHAR event.
+            let character = if character == b'\n' as u16 {
+                b'\r' as u16
+            } else {
+                character
+            };
+            let mut event = new_key_event(KeyEventType::CHAR, 0);
+            event.windows_key_code = character as i32;
+            event.character = character;
+            event.unmodified_character = character;
+            event
+        })
+        .collect()
 }
 
 /// The matching key release event.
@@ -97,8 +119,109 @@ pub(crate) fn key_up_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     let vk = windows_key_code(&keystroke.key);
     let mut event = new_key_event(KeyEventType::KEYUP, modifiers(&keystroke.modifiers));
     event.windows_key_code = vk;
-    event.native_key_code = vk;
+    event.native_key_code = native_key_code(&keystroke.key, vk);
+    event.character = first_utf16(keystroke.key_char.as_deref().unwrap_or_default());
+    event.unmodified_character = first_utf16(&keystroke.key);
     event
+}
+
+fn first_utf16(text: &str) -> u16 {
+    text.encode_utf16().next().unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn native_key_code(key: &str, _windows_key_code: i32) -> i32 {
+    match key {
+        "a" => 0,
+        "s" => 1,
+        "d" => 2,
+        "f" => 3,
+        "h" => 4,
+        "g" => 5,
+        "z" => 6,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "b" => 11,
+        "q" => 12,
+        "w" => 13,
+        "e" => 14,
+        "r" => 15,
+        "y" => 16,
+        "t" => 17,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "6" => 22,
+        "5" => 23,
+        "=" => 24,
+        "9" => 25,
+        "7" => 26,
+        "-" => 27,
+        "8" => 28,
+        "0" => 29,
+        "]" => 30,
+        "o" => 31,
+        "u" => 32,
+        "[" => 33,
+        "i" => 34,
+        "p" => 35,
+        "enter" => 36,
+        "l" => 37,
+        "j" => 38,
+        "'" => 39,
+        "k" => 40,
+        ";" => 41,
+        "\\" => 42,
+        "," => 43,
+        "/" => 44,
+        "n" => 45,
+        "m" => 46,
+        "." => 47,
+        "tab" => 48,
+        "space" => 49,
+        "`" => 50,
+        "backspace" => 51,
+        "escape" => 53,
+        "cmd" | "platform" => 55,
+        "shift" => 56,
+        "capslock" => 57,
+        "alt" => 58,
+        "ctrl" | "control" => 59,
+        "f5" => 96,
+        "f6" => 97,
+        "f7" => 98,
+        "f3" => 99,
+        "f8" => 100,
+        "f9" => 101,
+        "f11" => 103,
+        "f13" => 105,
+        "f16" => 106,
+        "f14" => 107,
+        "f10" => 109,
+        "f12" => 111,
+        "f15" => 113,
+        "insert" => 114,
+        "home" => 115,
+        "pageup" => 116,
+        "delete" => 117,
+        "f4" => 118,
+        "end" => 119,
+        "f2" => 120,
+        "pagedown" => 121,
+        "f1" => 122,
+        "left" => 123,
+        "right" => 124,
+        "down" => 125,
+        "up" => 126,
+        _ => 0,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_key_code(_key: &str, windows_key_code: i32) -> i32 {
+    windows_key_code
 }
 
 /// gpui key name to Windows virtual key code.
@@ -219,13 +342,36 @@ mod tests {
     }
 
     #[test]
-    fn a_key_press_sends_only_the_physical_key() {
-        // The character itself goes through the input handler, so emitting CHAR
-        // here as well would insert everything twice.
+    fn a_key_press_maps_the_physical_key() {
         let event = key_down_event(&keystroke("a", Some("a"), Modifiers::default()));
         assert_eq!(event.type_, KeyEventType::RAWKEYDOWN);
         assert_eq!(event.windows_key_code, 'A' as i32);
-        assert_eq!(event.character, 0);
+        assert_eq!(event.character, 'a' as u16);
+        assert_eq!(event.unmodified_character, 'a' as u16);
+    }
+
+    #[test]
+    fn committed_text_emits_character_input() {
+        let events = text_events("a");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].type_, KeyEventType::CHAR);
+        assert_eq!(events[0].character, 'a' as u16);
+    }
+
+    #[test]
+    fn committed_unicode_preserves_utf16() {
+        let events = text_events("日本");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].character, '日' as u16);
+        assert_eq!(events[1].character, '本' as u16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_native_hardware_key_codes() {
+        let event = key_down_event(&keystroke("x", Some("x"), Modifiers::default()));
+        assert_eq!(event.windows_key_code, 'X' as i32);
+        assert_eq!(event.native_key_code, 7);
     }
 
     #[test]

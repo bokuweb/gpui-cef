@@ -200,6 +200,9 @@ pub struct Webview {
     shared: Rc<Shared>,
     browser: Option<Browser>,
     focus_handle: gpui::FocusHandle,
+    /// Set when AppKit consumes the current key as marked text. Key dispatch
+    /// is deferred until that decision is available.
+    ime_handled_key: bool,
     _pump: pump::Registration,
     _focus_subscriptions: [gpui::Subscription; 2],
 }
@@ -276,6 +279,7 @@ impl Webview {
             shared,
             browser,
             focus_handle,
+            ime_handled_key: false,
             _pump: pump,
             _focus_subscriptions: focus_subscriptions,
         }
@@ -398,13 +402,20 @@ impl Webview {
         host.send_mouse_wheel_event(Some(&cef_event), dx.round() as i32, dy.round() as i32);
     }
 
-    fn send_key_down(&self, event: &KeyDownEvent) {
-        let Some(host) = self.host() else { return };
-        // Only the physical key goes through here. The text it produces arrives
-        // via the input handler in [`ime`], which is also the only path that
-        // works for anything needing composition. Sending CHAR as well would
-        // insert every character twice.
-        host.send_key_event(Some(&input::key_down_event(&event.keystroke)));
+    fn send_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        let keystroke = event.keystroke.clone();
+        // CEF's macOS OSR client waits until NSTextInputClient has processed
+        // the native event. This avoids sending the underlying Roman key when
+        // the input method produced marked text instead.
+        cx.defer_in(window, move |this, _, _| {
+            if this.ime_handled_key {
+                this.ime_handled_key = false;
+                return;
+            }
+            if let Some(host) = this.host() {
+                host.send_key_event(Some(&input::key_down_event(&keystroke)));
+            }
+        });
     }
 
     fn send_key_up(&self, event: &KeyUpEvent) {
@@ -460,7 +471,9 @@ impl Render for Webview {
             .on_scroll_wheel(
                 cx.listener(|this, event: &ScrollWheelEvent, _, _| this.send_scroll(event)),
             )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| this.send_key_down(event)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.send_key_down(event, window, cx)
+            }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.send_key_up(event)))
             .child(WebviewSurface {
                 shared: self.shared.clone(),
