@@ -38,7 +38,8 @@ impl Webview {
                 // The ranges AppKit gives gpui refer to our small composition
                 // mirror, not to the page's document. CEF already owns the real
                 // selection, so an absent replacement range commits at its caret.
-                host.ime_commit_text(Some(&text.into()), None, 0);
+                let replacement_range = invalid_cef_range();
+                host.ime_commit_text(Some(&text.into()), Some(&replacement_range), 0);
             } else {
                 // ImeCommitText completes an existing composition; it is not
                 // Chromium's general text insertion API. Plain text therefore
@@ -70,12 +71,16 @@ impl Webview {
                 color: 0xff00_0000,
                 ..Default::default()
             }];
+            // AppKit reports NSNotFound when no document range should be
+            // replaced. cefclient preserves that as UINT_MAX rather than a
+            // null pointer, which is significant to Chromium's macOS path.
+            let replacement_range = invalid_cef_range();
             host.ime_set_composition(
                 Some(&text.into()),
                 Some(&underlines),
                 // GPUI's range is relative to the mirrored composition and
                 // cannot be used as a document range in Chromium.
-                None,
+                Some(&replacement_range),
                 selection.map(cef_range).as_ref(),
             );
         }
@@ -231,6 +236,13 @@ fn cef_range(range: Range<usize>) -> CefRange {
     }
 }
 
+fn invalid_cef_range() -> CefRange {
+    CefRange {
+        from: u32::MAX,
+        to: u32::MAX,
+    }
+}
+
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
@@ -260,6 +272,13 @@ mod tests {
     fn utf16_slice_uses_the_same_units_the_os_does() {
         assert_eq!(utf16_slice("にほんご", 1..3), "ほん");
         assert_eq!(utf16_slice("abc", 0..2), "ab");
+    }
+
+    #[test]
+    fn invalid_range_matches_cef_macos_ns_not_found() {
+        let range = invalid_cef_range();
+        assert_eq!(range.from, u32::MAX);
+        assert_eq!(range.to, u32::MAX);
     }
 
     #[test]
