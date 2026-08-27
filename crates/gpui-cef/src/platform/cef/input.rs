@@ -394,6 +394,80 @@ mod tests {
     }
 
     #[test]
+    fn every_unicode_control_character_bypasses_text_input() {
+        for value in 0..=0x9f {
+            let Some(character) = char::from_u32(value) else {
+                continue;
+            };
+            if !character.is_control() {
+                continue;
+            }
+
+            let text = character.to_string();
+            assert!(
+                !should_wait_for_text_input(&keystroke(
+                    "synthetic-control",
+                    Some(&text),
+                    Modifiers::default()
+                )),
+                "U+{value:04X} must be forwarded as a raw key"
+            );
+        }
+    }
+
+    #[test]
+    fn named_editing_and_navigation_keys_bypass_text_input() {
+        for key in [
+            "backspace",
+            "delete",
+            "escape",
+            "insert",
+            "left",
+            "right",
+            "up",
+            "down",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+        ] {
+            assert!(
+                !should_wait_for_text_input(&keystroke(key, None, Modifiers::default())),
+                "{key} must be forwarded as a raw key"
+            );
+            assert_ne!(
+                windows_key_code(key),
+                0,
+                "{key} must have a CEF virtual-key mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcuts_and_function_keys_bypass_text_input() {
+        for modifiers in [
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            Modifiers {
+                function: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!should_wait_for_text_input(&keystroke(
+                "a",
+                Some("a"),
+                modifiers
+            )));
+        }
+    }
+
+    #[test]
     fn committed_text_emits_character_input() {
         let events = text_events("a");
         assert_eq!(events.len(), 1);
