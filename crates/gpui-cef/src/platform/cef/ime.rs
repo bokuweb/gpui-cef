@@ -22,7 +22,7 @@
 
 use std::ops::Range;
 
-use cef::{ImplBrowserHost, Range as CefRange};
+use cef::{CompositionUnderline, ImplBrowserHost, Range as CefRange};
 use gpui::{Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window};
 
 use super::Webview;
@@ -59,11 +59,20 @@ impl Webview {
             "compose_now text={text:?} selection={selection:?}"
         ));
         if let Some(host) = self.host() {
+            // Match cefclient's macOS OSR implementation. Even when AppKit
+            // supplies an un-attributed string it creates a default underline
+            // spanning the whole composition instead of passing a null list.
+            let underlines = [CompositionUnderline {
+                range: CefRange {
+                    from: 0,
+                    to: utf16_len(text) as u32,
+                },
+                color: 0xff00_0000,
+                ..Default::default()
+            }];
             host.ime_set_composition(
                 Some(&text.into()),
-                // Passing no underlines lets Chromium apply its own, which is
-                // what a page would get from a normal browser.
-                None,
+                Some(&underlines),
                 // GPUI's range is relative to the mirrored composition and
                 // cannot be used as a document range in Chromium.
                 None,

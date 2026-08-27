@@ -121,9 +121,13 @@ wrap_render_handler! {
         fn on_ime_composition_range_changed(
             &self,
             _browser: Option<&mut Browser>,
-            _selected_range: Option<&Range>,
+            selected_range: Option<&Range>,
             character_bounds: Option<&[Rect]>,
         ) {
+            super::input_trace(format_args!(
+                "CEF composition range changed selected={selected_range:?} bounds={}",
+                character_bounds.map_or(0, <[Rect]>::len)
+            ));
             let bounds = character_bounds
                 .unwrap_or_default()
                 .iter()
