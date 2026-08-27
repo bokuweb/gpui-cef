@@ -90,6 +90,21 @@ pub(crate) fn key_down_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     event
 }
 
+/// Whether a key should wait for AppKit to resolve it as committed text.
+///
+/// Return and Tab have a `key_char` in gpui, but AppKit handles them as editing
+/// commands rather than calling `insertText:`. Holding those events would
+/// therefore prevent CEF from ever seeing their physical key press.
+pub(crate) fn should_wait_for_text_input(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    !modifiers.control
+        && !modifiers.platform
+        && !modifiers.function
+        && keystroke.key_char.as_deref().is_some_and(|text| {
+            !text.is_empty() && text.chars().all(|character| !character.is_control())
+        })
+}
+
 /// Character input committed by the platform text input client.
 ///
 /// CEF does not derive text from `RAWKEYDOWN` for a windowless browser. GPUI's
@@ -348,6 +363,34 @@ mod tests {
         assert_eq!(event.windows_key_code, 'A' as i32);
         assert_eq!(event.character, 'a' as u16);
         assert_eq!(event.unmodified_character, 'a' as u16);
+    }
+
+    #[test]
+    fn printable_keys_wait_for_appkit_text_input() {
+        assert!(should_wait_for_text_input(&keystroke(
+            "a",
+            Some("a"),
+            Modifiers::default()
+        )));
+        assert!(should_wait_for_text_input(&keystroke(
+            "space",
+            Some(" "),
+            Modifiers::default()
+        )));
+    }
+
+    #[test]
+    fn editing_commands_do_not_wait_for_text_input() {
+        assert!(!should_wait_for_text_input(&keystroke(
+            "enter",
+            Some("\n"),
+            Modifiers::default()
+        )));
+        assert!(!should_wait_for_text_input(&keystroke(
+            "tab",
+            Some("\t"),
+            Modifiers::default()
+        )));
     }
 
     #[test]
