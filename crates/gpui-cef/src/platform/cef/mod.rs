@@ -417,12 +417,7 @@ impl Webview {
             "key down key={:?} char={:?} modifiers={:?}",
             keystroke.key, keystroke.key_char, keystroke.modifiers
         ));
-        let modifiers = keystroke.modifiers;
-        let is_printable_text = keystroke.key_char.is_some()
-            && !modifiers.control
-            && !modifiers.platform
-            && !modifiers.function;
-        if is_printable_text {
+        if input::should_wait_for_text_input(&keystroke) {
             input_trace("printable raw key held for AppKit text decision");
             self.pending_printable_key = Some(keystroke);
         } else if let Some(host) = self.host() {

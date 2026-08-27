@@ -90,6 +90,21 @@ pub(crate) fn key_down_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     event
 }
 
+/// Whether a key should wait for AppKit to resolve it as committed text.
+///
+/// Return and Tab have a `key_char` in gpui, but AppKit handles them as editing
+/// commands rather than calling `insertText:`. Holding those events would
+/// therefore prevent CEF from ever seeing their physical key press.
+pub(crate) fn should_wait_for_text_input(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    !modifiers.control
+        && !modifiers.platform
+        && !modifiers.function
+        && keystroke.key_char.as_deref().is_some_and(|text| {
+            !text.is_empty() && text.chars().all(|character| !character.is_control())
+        })
+}
+
 /// Character input committed by the platform text input client.
 ///
 /// CEF does not derive text from `RAWKEYDOWN` for a windowless browser. GPUI's
@@ -348,6 +363,108 @@ mod tests {
         assert_eq!(event.windows_key_code, 'A' as i32);
         assert_eq!(event.character, 'a' as u16);
         assert_eq!(event.unmodified_character, 'a' as u16);
+    }
+
+    #[test]
+    fn printable_keys_wait_for_appkit_text_input() {
+        assert!(should_wait_for_text_input(&keystroke(
+            "a",
+            Some("a"),
+            Modifiers::default()
+        )));
+        assert!(should_wait_for_text_input(&keystroke(
+            "space",
+            Some(" "),
+            Modifiers::default()
+        )));
+    }
+
+    #[test]
+    fn editing_commands_do_not_wait_for_text_input() {
+        assert!(!should_wait_for_text_input(&keystroke(
+            "enter",
+            Some("\n"),
+            Modifiers::default()
+        )));
+        assert!(!should_wait_for_text_input(&keystroke(
+            "tab",
+            Some("\t"),
+            Modifiers::default()
+        )));
+    }
+
+    #[test]
+    fn every_unicode_control_character_bypasses_text_input() {
+        for value in 0..=0x9f {
+            let Some(character) = char::from_u32(value) else {
+                continue;
+            };
+            if !character.is_control() {
+                continue;
+            }
+
+            let text = character.to_string();
+            assert!(
+                !should_wait_for_text_input(&keystroke(
+                    "synthetic-control",
+                    Some(&text),
+                    Modifiers::default()
+                )),
+                "U+{value:04X} must be forwarded as a raw key"
+            );
+        }
+    }
+
+    #[test]
+    fn named_editing_and_navigation_keys_bypass_text_input() {
+        for key in [
+            "backspace",
+            "delete",
+            "escape",
+            "insert",
+            "left",
+            "right",
+            "up",
+            "down",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+        ] {
+            assert!(
+                !should_wait_for_text_input(&keystroke(key, None, Modifiers::default())),
+                "{key} must be forwarded as a raw key"
+            );
+            assert_ne!(
+                windows_key_code(key),
+                0,
+                "{key} must have a CEF virtual-key mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcuts_and_function_keys_bypass_text_input() {
+        for modifiers in [
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            Modifiers {
+                function: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!should_wait_for_text_input(&keystroke(
+                "a",
+                Some("a"),
+                modifiers
+            )));
+        }
     }
 
     #[test]
