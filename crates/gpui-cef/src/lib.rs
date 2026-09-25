@@ -44,8 +44,39 @@
 mod options;
 mod platform;
 
-pub use options::{RuntimeOptions, WebviewOptions};
+pub use options::{CookieSpec, RuntimeOptions, SameSite, WebviewOptions};
 pub use platform::{init, Runtime, Webview};
+
+/// What a [`Webview`] reports to the application, through
+/// [`gpui::EventEmitter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebviewEvent {
+    /// A message the page posted with the script [`post_message_script`]
+    /// returns.
+    ///
+    /// Untrusted: any script running in the page can post one, so treat it as
+    /// input from the page, not from the application.
+    Message(String),
+}
+
+/// What a console line starts with when it is a message for the application.
+/// The page never needs to spell it out: [`post_message_script`] does.
+pub const MESSAGE_PREFIX: &str = "gpui-cef:message:";
+
+/// JavaScript that evaluates `expression`, turns it into a string, and posts
+/// it to the application as a [`WebviewEvent::Message`]. Pass it to
+/// [`Webview::eval`], or embed it in a script that does.
+///
+/// Messages travel through the page's console, which both backends can
+/// observe without code in the page's own process.
+pub fn post_message_script(expression: &str) -> String {
+    format!("console.debug({MESSAGE_PREFIX:?} + String({expression}))")
+}
+
+/// The message a console line carries, if it is one.
+pub fn message_payload(line: &str) -> Option<&str> {
+    line.strip_prefix(MESSAGE_PREFIX)
+}
 
 /// Something went wrong bringing up the browser engine.
 #[derive(Debug)]
@@ -55,6 +86,8 @@ pub enum Error {
     LibraryLoad(String),
     /// `cef_initialize` failed.
     Initialize,
+    /// The backend cannot do this on this platform.
+    Unsupported(&'static str),
     /// The webview backend could not be created.
     Backend(String),
 }
@@ -68,6 +101,7 @@ impl std::fmt::Display for Error {
                  the executable must live inside a bundled .app — see `just bundle`"
             ),
             Error::Initialize => write!(f, "cef_initialize() failed"),
+            Error::Unsupported(what) => write!(f, "not supported on this platform: {what}"),
             Error::Backend(msg) => write!(f, "failed to create the webview backend: {msg}"),
         }
     }
@@ -77,3 +111,22 @@ impl std::error::Error for Error {}
 
 /// The result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_posted_message_reads_back_from_its_console_line() {
+        let script = post_message_script("document.title");
+        assert_eq!(
+            script,
+            r#"console.debug("gpui-cef:message:" + String(document.title))"#
+        );
+        assert_eq!(
+            message_payload(r#"gpui-cef:message:{"a":1}"#),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(message_payload("an ordinary log line"), None);
+    }
+}

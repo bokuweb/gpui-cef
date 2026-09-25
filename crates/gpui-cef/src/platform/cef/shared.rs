@@ -93,6 +93,8 @@ pub(crate) struct Shared {
     /// The browser, kept here so the message pump can reach `BrowserHost`
     /// without borrowing gpui's `App`.
     browser: RefCell<Option<Browser>>,
+    /// Messages the page posted, waiting for the pump to emit them.
+    messages: RefCell<Vec<String>>,
 }
 
 impl Shared {
@@ -118,7 +120,19 @@ impl Shared {
             composition_bounds: RefCell::new(Vec::new()),
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
+            messages: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Queue a message the page posted; the pump emits it on its next pass.
+    pub(crate) fn push_message(&self, message: String) {
+        self.messages.borrow_mut().push(message);
+        self.dirty.set(true);
+    }
+
+    /// The messages posted since the last call.
+    pub(crate) fn take_messages(&self) -> Vec<String> {
+        std::mem::take(&mut *self.messages.borrow_mut())
     }
 
     /// Called from gpui's prepaint. Raises `resized` when the size changed.

@@ -33,7 +33,7 @@ pub(crate) fn input_trace(message: impl std::fmt::Display) {
 
 use cef::{
     args::Args, browser_host_create_browser_sync, execute_process, initialize,
-    library_loader::LibraryLoader, Browser, BrowserHost, BrowserSettings, ImplBrowser,
+    library_loader::LibraryLoader, Browser, BrowserHost, BrowserSettings, CefString, ImplBrowser,
     ImplBrowserHost, ImplFrame, Settings, WindowInfo,
 };
 use gpui::{
@@ -130,6 +130,31 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Puts cookies in the browser's store — the one every [`Webview`] shares,
+    /// kept under [`RuntimeOptions::cache_path`] when that is set — and says
+    /// how many it accepted. Call it after [`Runtime::start`].
+    ///
+    /// The store may turn a cookie down (a domain that does not match its URL,
+    /// say); that one is skipped rather than failing the rest.
+    pub fn set_cookies(&self, cookies: &[crate::CookieSpec]) -> crate::Result<usize> {
+        use cef::ImplCookieManager as _;
+
+        if !self.0.started.get() {
+            return Err(Error::Backend("set_cookies() called before start()".into()));
+        }
+        let manager = cef::cookie_manager_get_global_manager(None)
+            .ok_or_else(|| Error::Backend("no cookie store".into()))?;
+        let mut accepted = 0;
+        for spec in cookies {
+            let cookie = cef_cookie(spec);
+            let url = CefString::from(spec.url.as_str());
+            if manager.set_cookie(Some(&url), Some(&cookie), None) != 0 {
+                accepted += 1;
+            }
+        }
+        Ok(accepted)
     }
 
     /// Shuts CEF down. Call this once `gpui::Application::run` has returned.
@@ -441,6 +466,8 @@ impl Drop for Webview {
     }
 }
 
+impl gpui::EventEmitter<crate::WebviewEvent> for Webview {}
+
 impl Focusable for Webview {
     fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
         self.focus_handle.clone()
@@ -631,5 +658,31 @@ impl IntoElement for WebviewSurface {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+/// A [`crate::CookieSpec`] in CEF's shape. CEF counts time in microseconds
+/// from 1601-01-01.
+fn cef_cookie(spec: &crate::CookieSpec) -> cef::Cookie {
+    const EPOCH_GAP_SECONDS: i64 = 11_644_473_600;
+    let expires = spec.expires.map(|unix| cef::Basetime {
+        val: (unix + EPOCH_GAP_SECONDS) * 1_000_000,
+    });
+    cef::Cookie {
+        name: spec.name.as_str().into(),
+        value: spec.value.as_str().into(),
+        domain: spec.domain.as_str().into(),
+        path: spec.path.as_str().into(),
+        secure: spec.secure.into(),
+        httponly: spec.http_only.into(),
+        has_expires: expires.is_some().into(),
+        expires: expires.unwrap_or_default(),
+        same_site: match spec.same_site {
+            crate::SameSite::Unspecified => cef::CookieSameSite::UNSPECIFIED,
+            crate::SameSite::None => cef::CookieSameSite::NO_RESTRICTION,
+            crate::SameSite::Lax => cef::CookieSameSite::LAX_MODE,
+            crate::SameSite::Strict => cef::CookieSameSite::STRICT_MODE,
+        },
+        ..Default::default()
     }
 }

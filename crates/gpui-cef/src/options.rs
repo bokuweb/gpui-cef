@@ -73,3 +73,32 @@ impl WebviewOptions {
         }
     }
 }
+
+/// A cookie to put in the browser's store, for [`crate::Runtime::set_cookies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieSpec {
+    /// A URL the cookie belongs to, such as `https://github.com/`; the store
+    /// checks the cookie against it.
+    pub url: String,
+    pub name: String,
+    pub value: String,
+    /// The domain, with a leading dot for a domain cookie; empty for a
+    /// host-only cookie.
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    /// Seconds since the Unix epoch; `None` for a session cookie.
+    pub expires: Option<i64>,
+    pub same_site: SameSite,
+}
+
+/// A cookie's `SameSite` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SameSite {
+    #[default]
+    Unspecified,
+    None,
+    Lax,
+    Strict,
+}

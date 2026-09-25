@@ -12,7 +12,7 @@ repository = "https://github.com/bokuweb/gpui-cef"
 # runtime_shaders: hand the shader source to Metal at runtime instead of
 # compiling it with `xcrun metal` at build time, which removes the need for a
 # full Xcode.app install.
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui = "0.2.2"
 cef = "151"
 log = "0.4"
 parking_lot = "0.12"

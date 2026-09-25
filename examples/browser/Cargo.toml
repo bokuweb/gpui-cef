@@ -20,7 +20,7 @@ display-name = "gpui-cef browser"
 
 [dependencies]
 gpui-cef = { path = "../../crates/gpui-cef" }
-gpui.workspace = true
+gpui = { workspace = true, features = ["runtime_shaders"] }
 log.workspace = true
 env_logger = "0.11"
 
