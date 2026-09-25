@@ -77,7 +77,7 @@ impl Webview {
         let is_loading = Rc::new(Cell::new(true));
         let inbox: Rc<RefCell<Vec<String>>> = Rc::default();
         let entity = cx.weak_entity();
-        let mut app = cx.to_async();
+        let app = cx.to_async();
 
         let builder = WebViewBuilder::new()
             .with_url(&options.url)
@@ -92,6 +92,7 @@ impl Webview {
                     // WebView2 calls back from the message loop, where gpui is
                     // normally not mid-update; when it is, the message waits for
                     // the next render.
+                    let mut app = app.clone();
                     let emitted = entity.update(&mut app, |_, cx| {
                         cx.emit(crate::WebviewEvent::Message(message.clone()));
                     });

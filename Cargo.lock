@@ -2665,6 +2665,7 @@ dependencies = [
  "core-foundation 0.10.0",
  "core-video",
  "gpui",
+ "gpui_platform",
  "image",
  "io-surface",
  "log",

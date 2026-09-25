@@ -11,6 +11,10 @@ gpui.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 
+[dev-dependencies]
+# The usage example in the crate docs starts the app the way an app does.
+gpui_platform.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 cef.workspace = true
 image = "0.25"

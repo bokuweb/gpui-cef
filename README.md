@@ -37,7 +37,7 @@ fn main() {
     // Hand the closure a *clone*. Moving the value itself in would run
     // cef_shutdown() the moment the closure returns, taking the process with it.
     let cef = runtime.clone();
-    gpui::Application::new().run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         // 2. gpui has created NSApp by now, so initialize CEF here.
         cef.start(cx).unwrap();
 

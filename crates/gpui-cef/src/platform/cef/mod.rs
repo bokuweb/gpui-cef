@@ -173,7 +173,7 @@ impl Drop for RuntimeInner {
 }
 
 /// Loads CEF into the process. Call this **at the top of `main`**, before
-/// `gpui::Application::new()`. The actual initialization happens in
+/// `gpui_platform::application()`. The actual initialization happens in
 /// [`Runtime::start`].
 ///
 /// On macOS the executable has to live inside an `.app` bundle that ships
