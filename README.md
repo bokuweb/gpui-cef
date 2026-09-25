@@ -73,10 +73,9 @@ A page talks back to the application through its console: the script
 emits it as `WebviewEvent::Message`. Anything in the page can do this, so treat
 a message as input from the page.
 
-`gpui` is taken without extra features, so an application that links its own
-`gpui` — a git revision rather than the crates.io release — can point this
-crate at it with `[patch.crates-io]`. The demo turns on `runtime_shaders` for
-itself.
+`gpui` comes from Zed's repository, as it does for gpui-component: the
+application's lockfile picks the revision, so the app and this crate link one
+`gpui`. This repository's own lockfile pins the revision CI builds against.
 
 ### The demo (`examples/browser`)
 

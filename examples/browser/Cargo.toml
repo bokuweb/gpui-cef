@@ -20,7 +20,11 @@ display-name = "gpui-cef browser"
 
 [dependencies]
 gpui-cef = { path = "../../crates/gpui-cef" }
-gpui = { workspace = true, features = ["runtime_shaders"] }
+gpui.workspace = true
+# runtime_shaders: hand the shader source to Metal at runtime instead of
+# compiling it with `xcrun metal` at build time, which removes the need for a
+# full Xcode.app install.
+gpui_platform = { workspace = true, features = ["runtime_shaders"] }
 log.workspace = true
 env_logger = "0.11"
 

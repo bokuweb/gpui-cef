@@ -486,9 +486,9 @@ impl Render for Webview {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, _| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     // Focusing raises on_focus_in, which is what tells CEF.
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     this.send_mouse_down(event);
                 }),
             )

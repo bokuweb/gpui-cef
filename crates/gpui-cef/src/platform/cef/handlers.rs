@@ -316,7 +316,8 @@ fn cursor_style(cursor: CursorType) -> CursorStyle {
         CursorType::NOTALLOWED | CursorType::NODROP | CursorType::DND_NONE => {
             CursorStyle::OperationNotAllowed
         }
-        CursorType::NONE => CursorStyle::None,
+        // gpui has no hidden cursor; the arrow is the least surprising stand-in.
+        CursorType::NONE => CursorStyle::Arrow,
         CursorType::EASTRESIZE | CursorType::WESTRESIZE => CursorStyle::ResizeLeftRight,
         CursorType::NORTHRESIZE | CursorType::SOUTHRESIZE => CursorStyle::ResizeUpDown,
         CursorType::EASTWESTRESIZE => CursorStyle::ResizeLeftRight,
