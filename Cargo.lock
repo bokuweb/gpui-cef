@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-cef"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cef",
  "core-foundation 0.10.0",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-cef-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cef",
  "env_logger",
@@ -7969,7 +7969,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cef",
