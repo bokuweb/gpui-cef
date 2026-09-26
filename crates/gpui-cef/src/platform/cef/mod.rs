@@ -180,6 +180,15 @@ impl Drop for RuntimeInner {
 /// `Frameworks/Chromium Embedded Framework.framework` — the layout `xtask`
 /// produces.
 pub fn init(options: RuntimeOptions) -> crate::Result<Runtime> {
+    // Checked before anything is loaded: CEF's own loader does not report a
+    // missing framework, it stops the process — and an app run with
+    // `cargo run`, outside its bundle, should get an error it can carry on
+    // without rather than a crash at launch.
+    let exe = std::env::current_exe().map_err(|e| Error::LibraryLoad(e.to_string()))?;
+    if framework_binary(&exe).is_none() {
+        return Err(Error::LibraryLoad(exe.display().to_string()));
+    }
+
     // Loading the framework and running execute_process twice is not something
     // CEF expects, and the failure mode is a confusing crash much later.
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -187,7 +196,6 @@ pub fn init(options: RuntimeOptions) -> crate::Result<Runtime> {
         return Err(Error::Backend("gpui_cef::init() called twice".into()));
     }
 
-    let exe = std::env::current_exe().map_err(|e| Error::LibraryLoad(e.to_string()))?;
     let loader = LibraryLoader::new(&exe, false);
     if !loader.load() {
         return Err(Error::LibraryLoad(exe.display().to_string()));
@@ -684,5 +692,42 @@ fn cef_cookie(spec: &crate::CookieSpec) -> cef::Cookie {
             crate::SameSite::Strict => cef::CookieSameSite::STRICT_MODE,
         },
         ..Default::default()
+    }
+}
+
+/// Where CEF's loader will look for the framework binary, if it is there:
+/// `Contents/Frameworks` beside the executable's `Contents/MacOS`.
+fn framework_binary(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let binary = exe
+        .parent()?
+        .join("../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework");
+    binary.exists().then_some(binary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::framework_binary;
+
+    #[test]
+    fn the_framework_is_found_only_where_the_bundle_keeps_it() {
+        let root = std::env::temp_dir().join(format!("gpui-cef-framework-{}", std::process::id()));
+        let exe = root.join("Demo.app/Contents/MacOS/demo");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        assert_eq!(
+            framework_binary(&exe),
+            None,
+            "a bare executable has no framework"
+        );
+
+        let binary = root.join(
+            "Demo.app/Contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework",
+        );
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"").unwrap();
+        assert_eq!(
+            framework_binary(&exe).map(|path| path.canonicalize().unwrap()),
+            Some(binary.canonicalize().unwrap())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
