@@ -18,6 +18,11 @@ impl Runtime {
         Ok(())
     }
 
+    /// Cookies need a browser store, which this platform does not have.
+    pub fn set_cookies(&self, _cookies: &[crate::CookieSpec]) -> crate::Result<usize> {
+        Err(crate::Error::Unsupported("cookies"))
+    }
+
     /// Does nothing.
     pub fn shutdown(self) {}
 }
@@ -26,6 +31,8 @@ impl Runtime {
 pub fn init(_options: RuntimeOptions) -> crate::Result<Runtime> {
     Ok(Runtime)
 }
+
+impl gpui::EventEmitter<crate::WebviewEvent> for Webview {}
 
 /// A webview that draws nothing, with the same API as the real backends.
 pub struct Webview {

@@ -13,9 +13,9 @@
 //! whether a load is in flight come straight from CEF's `LoadHandler`.
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, size, Application, Bounds, Context, Entity, FocusHandle,
-    Focusable, FontWeight, KeyDownEvent, MouseButton, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, rgba, size, Bounds, Context, Entity, FocusHandle, Focusable,
+    FontWeight, KeyDownEvent, MouseButton, SharedString, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_cef::{RuntimeOptions, Webview, WebviewOptions};
 
@@ -89,7 +89,7 @@ impl BrowserWindow {
         self.editing_address = None;
         // Hand the keyboard back to the page.
         let focus = self.webview.read(cx).focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -110,7 +110,7 @@ impl BrowserWindow {
             "escape" => {
                 self.editing_address = None;
                 let focus = self.webview.read(cx).focus_handle(cx);
-                window.focus(&focus);
+                window.focus(&focus, cx);
                 cx.notify();
                 return;
             }
@@ -229,7 +229,7 @@ impl BrowserWindow {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            window.focus(&this.address_focus);
+                            window.focus(&this.address_focus, cx);
                             // Start editing from whatever URL is showing.
                             if this.editing_address.is_none() {
                                 this.editing_address = Some(this.webview.read(cx).url());
@@ -525,7 +525,7 @@ fn main() {
     // Hand the closure a clone. Moving the value in would run cef_shutdown() the
     // moment the closure returns, taking the process with it.
     let cef = runtime.clone();
-    Application::new().run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         // 2. gpui has created NSApp by now, so initialize CEF here. The other
         //    order lets CEF claim the NSApplication singleton and gpui crashes.
         if let Err(err) = cef.start(cx) {

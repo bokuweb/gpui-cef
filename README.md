@@ -37,7 +37,7 @@ fn main() {
     // Hand the closure a *clone*. Moving the value itself in would run
     // cef_shutdown() the moment the closure returns, taking the process with it.
     let cef = runtime.clone();
-    gpui::Application::new().run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         // 2. gpui has created NSApp by now, so initialize CEF here.
         cef.start(cx).unwrap();
 
@@ -65,6 +65,17 @@ with anything else.
 | `title` | yes | no — always empty |
 | `is_loading` | yes | approximated from page load events |
 | `can_go_back` / `can_go_forward` | yes | no — always `true` |
+| `WebviewEvent::Message` (page to app, via `post_message_script`) | yes | yes |
+| `Runtime::set_cookies` | yes | no — `Error::Unsupported` |
+
+A page talks back to the application through its console: the script
+`post_message_script(expr)` returns logs `expr` with a prefix, and the webview
+emits it as `WebviewEvent::Message`. Anything in the page can do this, so treat
+a message as input from the page.
+
+`gpui` comes from Zed's repository, as it does for gpui-component: the
+application's lockfile picks the revision, so the app and this crate link one
+`gpui`. This repository's own lockfile pins the revision CI builds against.
 
 ### The demo (`examples/browser`)
 

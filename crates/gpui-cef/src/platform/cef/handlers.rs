@@ -262,6 +262,28 @@ wrap_display_handler! {
             }
         }
 
+        /// A console line carrying [`crate::MESSAGE_PREFIX`] is a message for
+        /// the application: it is queued for the pump and kept off the console.
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: cef::LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(message) = message.map(|message| message.to_string()) else {
+                return 0;
+            };
+            match crate::message_payload(&message) {
+                Some(payload) => {
+                    self.state.shared.push_message(payload.to_string());
+                    1
+                }
+                None => 0,
+            }
+        }
+
         /// Off-screen rendering means CEF never touches the real cursor, so the
         /// page's choice is forwarded to gpui instead.
         fn on_cursor_change(
@@ -294,7 +316,8 @@ fn cursor_style(cursor: CursorType) -> CursorStyle {
         CursorType::NOTALLOWED | CursorType::NODROP | CursorType::DND_NONE => {
             CursorStyle::OperationNotAllowed
         }
-        CursorType::NONE => CursorStyle::None,
+        // gpui has no hidden cursor; the arrow is the least surprising stand-in.
+        CursorType::NONE => CursorStyle::Arrow,
         CursorType::EASTRESIZE | CursorType::WESTRESIZE => CursorStyle::ResizeLeftRight,
         CursorType::NORTHRESIZE | CursorType::SOUTHRESIZE => CursorStyle::ResizeUpDown,
         CursorType::EASTWESTRESIZE => CursorStyle::ResizeLeftRight,

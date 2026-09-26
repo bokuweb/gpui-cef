@@ -11,10 +11,14 @@ gpui.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 
+[dev-dependencies]
+# The usage example in the crate docs starts the app the way an app does.
+gpui_platform.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 cef.workspace = true
 image = "0.25"
-core-video = { version = "0.4.3", features = ["metal"] }
+core-video = { version = "0.5.2", features = ["metal"] }
 io-surface = "0.16"
 objc2 = "0.6"
 core-foundation = "0.10"
