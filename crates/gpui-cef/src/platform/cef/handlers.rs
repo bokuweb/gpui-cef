@@ -11,9 +11,10 @@ use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
-use super::shared::{Frame as SharedFrame, JsDialogReply, Shared};
+use super::shared::{FileDialogReply, Frame as SharedFrame, JsDialogReply, Shared};
 use crate::{
-    DialogPolicy, JsDialogKind, NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions,
+    DialogPolicy, FileDialogMode as Mode, JsDialogKind, NavigationRequest, PopupPolicy,
+    WebviewEvent, WebviewOptions,
 };
 
 /// Settings carried by `cef::App`.
@@ -613,6 +614,113 @@ wrap_jsdialog_handler! {
     }
 }
 
+wrap_dialog_handler! {
+    pub(crate) struct GpuiCefDialogHandler {
+        state: PageState,
+    }
+
+    impl DialogHandler {
+        /// `<input type="file">` and the file picker APIs. CEF's own picker
+        /// needs a window, so the application chooses instead.
+        fn on_file_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            mode: FileDialogMode,
+            title: Option<&CefString>,
+            default_file_path: Option<&CefString>,
+            accept_filters: Option<&mut CefStringList>,
+            accept_extensions: Option<&mut CefStringList>,
+            _accept_descriptions: Option<&mut CefStringList>,
+            callback: Option<&mut FileDialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            let (Some(mode), false) = (file_dialog_mode(mode), self.state.shared.is_closed())
+            else {
+                callback.cancel();
+                return 1;
+            };
+            let filters = string_list(accept_filters);
+            let extensions = accept_extensions_of(&filters, &string_list(accept_extensions));
+            let id = self.state.shared.add_file_dialog(FileDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::FileDialog {
+                id,
+                mode,
+                title: string(title),
+                default_path: Some(string(default_file_path))
+                    .filter(|path| !path.is_empty())
+                    .map(Into::into),
+                accept_filters: filters,
+                accept_extensions: extensions,
+            });
+            // Returning 1 keeps CEF from asking again or showing a picker of
+            // its own.
+            1
+        }
+    }
+}
+
+fn file_dialog_mode(mode: FileDialogMode) -> Option<Mode> {
+    match mode {
+        FileDialogMode::OPEN => Some(Mode::Open),
+        FileDialogMode::OPEN_MULTIPLE => Some(Mode::OpenMultiple),
+        FileDialogMode::OPEN_FOLDER => Some(Mode::OpenFolder),
+        FileDialogMode::SAVE => Some(Mode::Save),
+        _ => None,
+    }
+}
+
+/// The file extensions an `accept` attribute allows, lower-case and without
+/// the dot. CEF lists the filters as written (`image/*`, `.DOCX`) and, beside
+/// each, the extensions a MIME type stands for (`.png;.jpg`), or nothing when
+/// it does not know.
+fn accept_extensions_of(filters: &[String], expansions: &[String]) -> Vec<String> {
+    let mut extensions: Vec<String> = Vec::new();
+    for (index, filter) in filters.iter().enumerate() {
+        let expansion = expansions
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let candidates = if expansion.is_empty() && filter.starts_with('.') {
+            filter.as_str()
+        } else {
+            expansion
+        };
+        for extension in candidates.split(';') {
+            let extension = extension.trim().trim_start_matches('.').to_lowercase();
+            if !extension.is_empty() && !extensions.contains(&extension) {
+                extensions.push(extension);
+            }
+        }
+    }
+    extensions
+}
+
+/// The strings in a list CEF passed to a callback. It still owns the list.
+fn string_list(list: Option<&mut CefStringList>) -> Vec<String> {
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    let raw: *mut cef::sys::_cef_string_list_t = list.into();
+    if raw.is_null() {
+        return Vec::new();
+    }
+    let count = unsafe { cef::sys::cef_string_list_size(raw) };
+    (0..count)
+        .filter_map(|index| unsafe {
+            let mut value: cef::sys::cef_string_t = std::mem::zeroed();
+            if cef::sys::cef_string_list_value(raw, index, &mut value) == 0 {
+                return None;
+            }
+            let text = CefString::from(std::ptr::from_ref(&value)).to_string();
+            // The list hands out a copy, which is ours to free.
+            cef::sys::cef_string_utf16_clear(&mut value);
+            Some(text)
+        })
+        .collect()
+}
+
 fn js_dialog_kind(dialog_type: JsdialogType) -> Option<JsDialogKind> {
     match dialog_type {
         JsdialogType::ALERT => Some(JsDialogKind::Alert),
@@ -647,6 +755,7 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         request_handler: RequestHandler,
         jsdialog_handler: JsdialogHandler,
+        dialog_handler: DialogHandler,
     }
 
     impl Client {
@@ -673,6 +782,10 @@ wrap_client! {
         fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
             Some(self.jsdialog_handler.clone())
         }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.dialog_handler.clone())
+        }
     }
 }
 
@@ -692,7 +805,8 @@ impl GpuiCefClient {
             GpuiCefLoadHandler::new(LoadState { shared }),
             GpuiCefLifeSpanHandler::new(page.clone()),
             GpuiCefRequestHandler::new(page.clone()),
-            GpuiCefJsDialogHandler::new(page),
+            GpuiCefJsDialogHandler::new(page.clone()),
+            GpuiCefDialogHandler::new(page),
         )
     }
 }
@@ -742,6 +856,40 @@ mod tests {
             js_dialog_kind(JsdialogType::PROMPT),
             Some(JsDialogKind::Prompt)
         );
+    }
+
+    #[test]
+    fn file_dialog_modes_map_across() {
+        assert_eq!(file_dialog_mode(FileDialogMode::OPEN), Some(Mode::Open));
+        assert_eq!(
+            file_dialog_mode(FileDialogMode::OPEN_MULTIPLE),
+            Some(Mode::OpenMultiple)
+        );
+        assert_eq!(
+            file_dialog_mode(FileDialogMode::OPEN_FOLDER),
+            Some(Mode::OpenFolder)
+        );
+        assert_eq!(file_dialog_mode(FileDialogMode::SAVE), Some(Mode::Save));
+    }
+
+    #[test]
+    fn accept_filters_become_extensions() {
+        let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A MIME type contributes what CEF expanded it to; an extension
+        // stands for itself even when CEF left its expansion empty.
+        assert_eq!(
+            accept_extensions_of(
+                &strings(&["image/*", ".DOCX", "application/x-unknown"]),
+                &strings(&[".png;.jpg; .JPG", "", ""])
+            ),
+            ["png", "jpg", "docx"]
+        );
+        // Repeats collapse, and no filters means no restriction.
+        assert_eq!(
+            accept_extensions_of(&strings(&[".txt", ".txt"]), &strings(&[".txt", ""])),
+            ["txt"]
+        );
+        assert!(accept_extensions_of(&[], &[]).is_empty());
     }
 
     #[test]

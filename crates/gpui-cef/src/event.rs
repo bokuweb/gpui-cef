@@ -66,7 +66,48 @@ pub enum WebviewEvent {
         /// "leave this page?" dialog.
         origin_url: String,
     },
+
+    /// The page wants a file chosen — an `<input type="file">` was clicked, or
+    /// it called `showOpenFilePicker()` and the like. Show a picker, then pass
+    /// the choice to
+    /// [`Webview::resolve_file_dialog`](crate::Webview::resolve_file_dialog).
+    /// macOS (CEF) only: WebView2 shows its own.
+    #[non_exhaustive]
+    FileDialog {
+        /// What to answer by.
+        id: FileDialogId,
+        /// What is being chosen.
+        mode: FileDialogMode,
+        /// A title the page asked for. Usually empty, meaning "Open" or "Save".
+        title: String,
+        /// Where to start, with a file name in it for [`FileDialogMode::Save`].
+        default_path: Option<std::path::PathBuf>,
+        /// What the page will accept, as it wrote it in `accept`: lower-case
+        /// MIME types (`image/*`) and extensions (`.docx`). Empty means anything.
+        accept_filters: Vec<String>,
+        /// The same, worked out to file extensions without the dot (`png`,
+        /// `docx`), for a picker that filters by extension. Empty when
+        /// nothing is known.
+        accept_extensions: Vec<String>,
+    },
 }
+
+/// What a [`WebviewEvent::FileDialog`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileDialogMode {
+    /// One existing file.
+    Open,
+    /// Any number of existing files (`<input multiple>`).
+    OpenMultiple,
+    /// A folder (`<input webkitdirectory>`).
+    OpenFolder,
+    /// Where to save a new file.
+    Save,
+}
+
+/// Identifies a [`WebviewEvent::FileDialog`] to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileDialogId(pub(crate) u64);
 
 /// Which JavaScript dialog a [`WebviewEvent::JsDialog`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

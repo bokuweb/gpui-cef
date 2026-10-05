@@ -410,6 +410,18 @@ impl Webview {
         self.shared.resolve_js_dialog(id, accept, text.as_deref())
     }
 
+    /// Answers a [`crate::WebviewEvent::FileDialog`] with the chosen paths, or
+    /// cancels it with `None` (or no paths).
+    ///
+    /// Returns `false` when it is no longer waiting.
+    pub fn resolve_file_dialog(
+        &self,
+        id: crate::FileDialogId,
+        paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        self.shared.resolve_file_dialog(id, paths.as_deref())
+    }
+
     fn host(&self) -> Option<BrowserHost> {
         self.browser.as_ref().and_then(|b| b.host())
     }

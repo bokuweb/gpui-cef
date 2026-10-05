@@ -70,6 +70,14 @@ impl Webview {
     ) -> bool {
         false
     }
+    /// Answers a file chooser. There never is one: always `false`.
+    pub fn resolve_file_dialog(
+        &self,
+        _id: crate::FileDialogId,
+        _paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        false
+    }
     /// The current page title. Always empty.
     pub fn title(&self) -> String {
         String::new()

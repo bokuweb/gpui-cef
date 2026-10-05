@@ -11,11 +11,14 @@ use std::{
     sync::Arc,
 };
 
-use cef::{Browser, BrowserHost, CefString, ImplBrowser, ImplJsdialogCallback, JsdialogCallback};
+use cef::{
+    Browser, BrowserHost, CefString, CefStringList, FileDialogCallback, ImplBrowser,
+    ImplFileDialogCallback, ImplJsdialogCallback, JsdialogCallback,
+};
 use gpui::{px, size, Bounds, CursorStyle, Pixels, RenderImage, Size};
 
 use super::pending::{Cancel, Pending};
-use crate::{DialogId, WebviewEvent};
+use crate::{DialogId, FileDialogId, WebviewEvent};
 
 /// The most recent frame handed over by CEF.
 pub(crate) enum Frame {
@@ -102,6 +105,8 @@ pub(crate) struct Shared {
     events: RefCell<Vec<WebviewEvent>>,
     /// JavaScript dialogs waiting for `Webview::resolve_dialog`.
     js_dialogs: Pending<JsDialogReply>,
+    /// File choosers waiting for `Webview::resolve_file_dialog`.
+    file_dialogs: Pending<FileDialogReply>,
     /// Set once the webview is gone. Anything the page asks for after that is
     /// turned down on the spot, since nobody is left to answer.
     closed: Cell<bool>,
@@ -120,6 +125,26 @@ impl JsDialogReply {
 impl Cancel for JsDialogReply {
     fn cancel(self) {
         self.answer(false, None);
+    }
+}
+
+/// The choice a file chooser is waiting for.
+pub(crate) struct FileDialogReply(pub(crate) FileDialogCallback);
+
+impl FileDialogReply {
+    fn answer(self, paths: &[std::path::PathBuf]) {
+        // CEF reads an empty list as a cancellation.
+        let mut list = CefStringList::new();
+        for path in paths {
+            list.append(&path.to_string_lossy());
+        }
+        self.0.cont(Some(&mut list));
+    }
+}
+
+impl Cancel for FileDialogReply {
+    fn cancel(self) {
+        self.0.cancel();
     }
 }
 
@@ -148,6 +173,7 @@ impl Shared {
             browser: RefCell::new(None),
             events: RefCell::new(Vec::new()),
             js_dialogs: Pending::default(),
+            file_dialogs: Pending::default(),
             closed: Cell::new(false),
         })
     }
@@ -162,6 +188,7 @@ impl Shared {
     pub(crate) fn close(&self) {
         self.closed.set(true);
         self.js_dialogs.cancel_all();
+        self.file_dialogs.cancel_all();
     }
 
     /// Keeps a JavaScript dialog until the application answers it.
@@ -176,6 +203,28 @@ impl Shared {
             return false;
         };
         reply.answer(accept, text);
+        true
+    }
+
+    /// Keeps a file chooser until the application answers it.
+    pub(crate) fn add_file_dialog(&self, reply: FileDialogReply) -> FileDialogId {
+        FileDialogId(self.file_dialogs.insert(reply))
+    }
+
+    /// Answers a file chooser; `None` or no paths cancels it. `false` when it
+    /// is no longer waiting.
+    pub(crate) fn resolve_file_dialog(
+        &self,
+        id: FileDialogId,
+        paths: Option<&[std::path::PathBuf]>,
+    ) -> bool {
+        let Some(reply) = self.file_dialogs.take(id.0) else {
+            return false;
+        };
+        match paths {
+            Some(paths) if !paths.is_empty() => reply.answer(paths),
+            _ => reply.cancel(),
+        }
         true
     }
 

@@ -211,6 +211,17 @@ impl Webview {
         false
     }
 
+    /// WebView2 shows its own file chooser and never emits
+    /// [`WebviewEvent::FileDialog`], so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_file_dialog(
+        &self,
+        _id: crate::FileDialogId,
+        _paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        false
+    }
+
     /// Whether a page is currently loading.
     pub fn is_loading(&self) -> bool {
         self.is_loading.get()
