@@ -42,6 +42,12 @@ bundle:
 run: bundle
     open target/bundle/gpui-cef-browser.app
 
+# Bundle, then click through the demo's feature test page over CEF's remote
+# debugging port and check each round trip. Opens a window, so it needs a
+# desktop session; needs Node 22 or later.
+e2e: bundle
+    node examples/browser/e2e.mjs
+
 fmt:
     cargo fmt --all
 
