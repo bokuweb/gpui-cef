@@ -36,6 +36,15 @@
 //!     runtime.shutdown();
 //! }
 //! ```
+//!
+//! # When the page needs the application
+//!
+//! A windowless browser has nowhere to show a dialog, a file picker or a popup
+//! of its own, so what the page asks for that needs one arrives as a
+//! [`WebviewEvent`] — subscribe with `cx.subscribe(&webview, ...)` — and is
+//! answered through the [`Webview`]: [`Webview::resolve_dialog`],
+//! [`Webview::resolve_file_dialog`], [`Webview::resolve_download`].
+//! [`WebviewOptions`] holds the policies for popups, navigation and dialogs.
 
 // The usage example above is deliberately a full `fn main`, since the ordering
 // around it is the whole point.

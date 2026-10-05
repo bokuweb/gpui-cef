@@ -67,6 +67,15 @@ with anything else.
 | `can_go_back` / `can_go_forward` | yes | no — always `true` |
 | `WebviewEvent::Message` (page to app, via `post_message_script`) | yes | yes |
 | `Runtime::set_cookies` | yes | no — `Error::Unsupported` |
+| Popups: `WebviewOptions::popups`, `WebviewEvent::PopupRequested` | yes | yes — `target_frame` is always empty and `user_gesture` always `false` |
+| `WebviewOptions::navigation_filter`, `WebviewEvent::NavigationBlocked` | yes, for the page and its frames | the page only; `is_redirect` and `user_gesture` are always `false` |
+| JavaScript dialogs: `WebviewEvent::JsDialog`, `resolve_dialog`, `WebviewOptions::js_dialogs` | yes | no — WebView2 shows its own |
+| File choosers: `WebviewEvent::FileDialog`, `resolve_file_dialog` | yes, except folders (see below) | no — WebView2 shows its own |
+| Downloads: `WebviewEvent::DownloadRequested`, `resolve_download` | yes; the download waits for the answer | a notice only: WebView2 has already saved it to its default folder, and `resolve_download` does nothing |
+| `WebviewEvent::DownloadUpdated` | progress, completion, cancellation, failure | completion and failure only |
+| `WebviewEvent::RenderProcessTerminated` | yes | no |
+| `WebviewEvent::LoadFailed` | yes | no |
+| `print_to_pdf`, `WebviewEvent::PdfPrinted` | yes | no — `Error::Unsupported` |
 
 A page talks back to the application through its console: the script
 `post_message_script(expr)` returns logs `expr` with a prefix, and the webview
@@ -76,6 +85,75 @@ a message as input from the page.
 `gpui` comes from Zed's repository, as it does for gpui-component: the
 application's lockfile picks the revision, so the app and this crate link one
 `gpui`. This repository's own lockfile pins the revision CI builds against.
+
+### When the page needs the application
+
+A windowless browser has no window of its own to put a dialog, a file
+picker, a popup or a "Save As" panel in, so whatever the page asks for that
+needs one comes to the application as a `WebviewEvent`, and the application
+answers through the webview:
+
+```rust
+use std::sync::Arc;
+use gpui::PromptLevel;
+use gpui_cef::{JsDialogKind, Webview, WebviewEvent, WebviewOptions};
+
+let webview = cx.new(|cx| {
+    Webview::new(window, cx, WebviewOptions {
+        // Asked about every navigation before it starts.
+        navigation_filter: Some(Arc::new(|request| !request.url.starts_with("http://"))),
+        ..WebviewOptions::url("https://example.com")
+    })
+});
+
+cx.subscribe_in(&webview, window, |_, webview, event, window, cx| match event {
+    // Popups never open a window; send them to the system browser instead.
+    WebviewEvent::PopupRequested { url, .. } => cx.open_url(url),
+    WebviewEvent::JsDialog { id, kind: JsDialogKind::Confirm, message, .. } => {
+        let (id, webview) = (*id, webview.downgrade());
+        let answer = window.prompt(PromptLevel::Info, message, None, &["OK", "Cancel"], cx);
+        cx.spawn(async move |_, cx| {
+            let accept = answer.await == Ok(0);
+            webview.update(cx, |webview, _| webview.resolve_dialog(id, accept, None)).ok();
+        })
+        .detach();
+    }
+    WebviewEvent::DownloadRequested { id, suggested_name, .. } => {
+        // ... cx.prompt_for_new_path(...), then
+        // webview.read(cx).resolve_download(id, Some(path)) — or None to cancel.
+    }
+    WebviewEvent::RenderProcessTerminated { .. } => webview.read(cx).reload(),
+    _ => {}
+})
+.detach();
+```
+
+- **Answer each request once**, by the id its event carried: `resolve_dialog`,
+  `resolve_file_dialog`, `resolve_download`. They return `false` for a request
+  that is no longer waiting.
+- **The page waits for the answer.** `alert()` and friends block the page's
+  script until they are answered, so an application that ignores
+  `JsDialog` leaves the page stuck; set `js_dialogs: DialogPolicy::AutoDismiss`
+  to have every dialog dismissed on the spot instead. A dialog still open when
+  the page navigates away is dismissed.
+- **Nothing is left hanging when the webview goes.** Dropping it dismisses open
+  dialogs, cancels file choosers, and cancels downloads that were never told
+  where to go; anything the page asks for after that is turned down.
+- **Popups never get a window.** By default they are blocked and reported;
+  `popups: PopupPolicy::LoadInPlace` loads them in the same webview.
+- **The navigation filter runs inside the browser engine**, synchronously, so
+  keep it quick and do not reach back into the webview from it. A panicking
+  filter counts as "no".
+- **A crashed renderer leaves the last frame on screen.** `reload()` starts a
+  new one and brings the page back.
+- **Print through `print_to_pdf`.** The page's own `window.print()` puts the
+  system print panel up as a window of its own, detached from the gpui window,
+  and holds the page until it closes.
+
+CEF calls these handlers on the main thread — with `external_message_pump` it
+is CEF's UI thread — from inside the message pump. They only queue events, and
+the pump emits them through gpui within a frame; the `resolve_*` calls answer
+CEF right away, on the same thread.
 
 ### The demo (`examples/browser`)
 
@@ -92,6 +170,32 @@ straight from CEF's `LoadHandler`.
 The webview is **clipped to rounded corners** and a **gpui element is drawn over
 it** in the bottom right. A child-view backend can do neither, which is the reason
 this crate exists.
+
+The side panel's **Feature test page** has a button for everything the webview
+hands to the application, and the demo answers each natively: gpui prompts for
+`alert`, `confirm` and "leave this page?", a gpui overlay with a text field for
+`prompt`, open and save panels for file choosers and downloads, the system
+browser for popups, a Reload banner after a renderer crash, and a save panel for
+printing to PDF. A navigation filter turns `blocked.example` away. The side panel
+lists the latest events. `GPUI_CEF_START_URL=features` starts on that page.
+
+## Upgrading from 0.1
+
+- `WebviewEvent` is `#[non_exhaustive]`, and so are its struct-like variants:
+  give a `match` a `_ => {}` arm, and match variants with `..`.
+- `WebviewOptions` has new fields; build it with `WebviewOptions::url(..)` or
+  `..Default::default()` as before.
+- **Behaviour changes on macOS.** Popups no longer open a native window; they
+  are blocked and reported as `PopupRequested`. JavaScript dialogs now wait for
+  `resolve_dialog`: an application that does not handle `JsDialog` should set
+  `js_dialogs: DialogPolicy::AutoDismiss`, or `alert()` will block the page.
+  Downloads, which used to be cancelled, now wait for `resolve_download`.
+- Page-to-app messages (`post_message_script`, `WebviewEvent::Message`) are
+  unchanged. A page that worked around the missing pieces through them can drop
+  the workarounds: an overridden `window.open` for `PopupRequested`, a
+  `confirm()` bridged through messages for `JsDialog`, a heartbeat watchdog for
+  `RenderProcessTerminated`, intercepted blob downloads for `DownloadRequested`,
+  a hand-rolled file input for `FileDialog`.
 
 ## How frames get across, and what zero-copy still needs
 
@@ -122,6 +226,18 @@ when running against a gpui that has one.
 ## Known limitations
 
 - **No drag and drop** between the page and the rest of the application.
+- **Folder uploads do not complete.** `<input webkitdirectory>` reaches the
+  application as a `FileDialog` in `OpenFolder` mode, but after the answer
+  Chromium asks the user to confirm the upload in a dialog a windowless browser
+  cannot show, and the page never receives the files.
+- **One download at a time without a click.** Chromium holds a page's second
+  download until the user has interacted with the page again, and asks for
+  permission in the meantime; Alloy-style CEF has no prompt for that, so a page
+  that starts several downloads in a row without user input gets the first.
+  Permission prompts in general (camera, microphone, notifications) are not
+  handled yet, which with Alloy means they are not granted.
+- **`window.print()`** opens the system print panel detached from the window;
+  see above.
 - **The CPU copy path is the default.** See the section above.
 - The cursor the page asks for is forwarded to gpui, but CEF's custom cursors
   (`CT_CUSTOM`) fall back to an arrow.
@@ -156,7 +272,22 @@ cargo test --workspace
 
 The tests cover the pure parts: the gpui-to-CEF input translation, the shared
 state that decides when CEF has to be told about a resize, the popup layer
-bookkeeping, the cursor mapping, and the demo's URL handling.
+bookkeeping, the cursor mapping, the bookkeeping of requests waiting on the
+application (ids, answering once, cancelling what is left), the event queue,
+the translation of CEF's dialog, download and termination types, and the
+demo's URL handling.
+
+```bash
+just e2e
+```
+
+checks the rest end to end on macOS. It bundles the demo, starts it with
+`GPUI_CEF_DEMO_AUTO=1` — which answers every dialog, file chooser and download
+on the spot rather than showing anything — on the feature test page, and clicks
+through the page over the remote debugging port with a small CDP client
+(`examples/browser/e2e.mjs`, Node 22, no dependencies). Each check looks at both
+ends: the event the demo logged, and what the page or the disk saw after the
+answer. It opens a real window, so it is not part of CI.
 
 Anything that needs a live browser is exercised by running the demo instead.
 CEF's remote debugging port is open, so `http://127.0.0.1:9229/json/list` plus
@@ -264,20 +395,27 @@ Fix: make `Runtime` an `Rc`-backed shared handle and pass the closure a clone.
 crates/gpui-cef/
   src/platform/cef/     macOS: draw CEF's off-screen output as a gpui element
     mod.rs              init / Runtime / Webview / Element
-    handlers.rs         CEF-side callbacks (RenderHandler and friends)
+    handlers.rs         CEF-side callbacks: rendering, display, loading, popups,
+                        navigation, dialogs, file choosers, downloads, crashes
+    pending.rs          requests waiting on the application's answer
     input.rs            gpui input events to CEF events
     nsapp.rs            retrofit CefAppProtocol onto NSApp
     pump.rs             drive CEF from a CFRunLoopTimer
     shared.rs           state shared between CEF and gpui
   src/platform/wry/     Windows: keep a WebView2 child window on the layout rect
-examples/browser/       demo app (main binary plus the CEF child-process helper)
+examples/browser/       demo app (main binary plus the CEF child-process helper),
+                        its feature test page, and the end-to-end check
 xtask/                  assembles the .app bundle
 ```
 
 ## Not verified
 
 - **The Windows backend has never been run.** CI compiles and lints it on
-  Windows, but nobody has watched it draw anything.
+  Windows, but nobody has watched it draw anything — popups, the navigation
+  filter and downloads through wry included.
+- **The demo's native answers.** `just e2e` answers automatically; that the
+  gpui prompt, the open and save panels and the `prompt()` overlay come up has
+  been seen in the window list, but clicking them has been left to a human.
 - **Typing.** The input-method wiring is unit tested for its offset arithmetic
   only. Synthesizing real key events needs macOS Accessibility permission, which
   the development machine does not have, so the round trip from keyboard to page
