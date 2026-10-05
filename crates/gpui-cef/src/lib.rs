@@ -45,10 +45,10 @@ mod event;
 mod options;
 mod platform;
 
-pub use event::WebviewEvent;
+pub use event::{DialogId, JsDialogKind, WebviewEvent};
 pub use options::{
-    CookieSpec, NavigationFilter, NavigationRequest, PopupPolicy, RuntimeOptions, SameSite,
-    WebviewOptions,
+    CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PopupPolicy, RuntimeOptions,
+    SameSite, WebviewOptions,
 };
 pub use platform::{init, Runtime, Webview};
 

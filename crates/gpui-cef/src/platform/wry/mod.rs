@@ -199,6 +199,18 @@ impl Webview {
         self.eval("window.stop()");
     }
 
+    /// WebView2 shows JavaScript dialogs itself and never emits
+    /// [`WebviewEvent::JsDialog`], so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_dialog(
+        &self,
+        _id: crate::DialogId,
+        _accept: bool,
+        _text: Option<String>,
+    ) -> bool {
+        false
+    }
+
     /// Whether a page is currently loading.
     pub fn is_loading(&self) -> bool {
         self.is_loading.get()

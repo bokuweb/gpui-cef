@@ -11,10 +11,11 @@ use std::{
     sync::Arc,
 };
 
-use cef::{Browser, BrowserHost, ImplBrowser};
+use cef::{Browser, BrowserHost, CefString, ImplBrowser, ImplJsdialogCallback, JsdialogCallback};
 use gpui::{px, size, Bounds, CursorStyle, Pixels, RenderImage, Size};
 
-use crate::WebviewEvent;
+use super::pending::{Cancel, Pending};
+use crate::{DialogId, WebviewEvent};
 
 /// The most recent frame handed over by CEF.
 pub(crate) enum Frame {
@@ -99,6 +100,27 @@ pub(crate) struct Shared {
     /// `do_message_loop_work()`, where gpui cannot be reached, so they queue
     /// here instead.
     events: RefCell<Vec<WebviewEvent>>,
+    /// JavaScript dialogs waiting for `Webview::resolve_dialog`.
+    js_dialogs: Pending<JsDialogReply>,
+    /// Set once the webview is gone. Anything the page asks for after that is
+    /// turned down on the spot, since nobody is left to answer.
+    closed: Cell<bool>,
+}
+
+/// The answer a JavaScript dialog is waiting for.
+pub(crate) struct JsDialogReply(pub(crate) JsdialogCallback);
+
+impl JsDialogReply {
+    fn answer(self, accept: bool, text: Option<&str>) {
+        let text = text.map(CefString::from);
+        self.0.cont(accept.into(), text.as_ref());
+    }
+}
+
+impl Cancel for JsDialogReply {
+    fn cancel(self) {
+        self.answer(false, None);
+    }
 }
 
 impl Shared {
@@ -125,7 +147,42 @@ impl Shared {
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
             events: RefCell::new(Vec::new()),
+            js_dialogs: Pending::default(),
+            closed: Cell::new(false),
         })
+    }
+
+    /// Whether the webview has gone; see [`Shared::close`].
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// The webview is gone: cancel everything still waiting on it, and turn
+    /// down whatever the page asks for from now on.
+    pub(crate) fn close(&self) {
+        self.closed.set(true);
+        self.js_dialogs.cancel_all();
+    }
+
+    /// Keeps a JavaScript dialog until the application answers it.
+    pub(crate) fn add_js_dialog(&self, reply: JsDialogReply) -> DialogId {
+        DialogId(self.js_dialogs.insert(reply))
+    }
+
+    /// Answers a JavaScript dialog. `false` when it is no longer waiting.
+    pub(crate) fn resolve_js_dialog(&self, id: DialogId, accept: bool, text: Option<&str>) -> bool {
+        // Taken out before answering: CEF may call straight back in.
+        let Some(reply) = self.js_dialogs.take(id.0) else {
+            return false;
+        };
+        reply.answer(accept, text);
+        true
+    }
+
+    /// Dismisses every JavaScript dialog still waiting — the page navigated
+    /// away, say, and they no longer mean anything.
+    pub(crate) fn cancel_js_dialogs(&self) {
+        self.js_dialogs.cancel_all();
     }
 
     /// Queue an event for the application; the pump emits it on its next pass.

@@ -16,6 +16,7 @@ mod handlers;
 mod ime;
 mod input;
 mod nsapp;
+mod pending;
 mod pump;
 mod shared;
 
@@ -400,6 +401,15 @@ impl Webview {
         }
     }
 
+    /// Answers a [`crate::WebviewEvent::JsDialog`]. `accept` is OK as opposed
+    /// to Cancel; `text` is what a `prompt()` returns when accepted.
+    ///
+    /// Returns `false` when the dialog is no longer waiting: answered already,
+    /// or dismissed because the page navigated away.
+    pub fn resolve_dialog(&self, id: crate::DialogId, accept: bool, text: Option<String>) -> bool {
+        self.shared.resolve_js_dialog(id, accept, text.as_deref())
+    }
+
     fn host(&self) -> Option<BrowserHost> {
         self.browser.as_ref().and_then(|b| b.host())
     }
@@ -468,6 +478,9 @@ impl Webview {
 
 impl Drop for Webview {
     fn drop(&mut self) {
+        // Before the browser closes, so nothing the page asked for is left
+        // waiting on an application that is no longer listening.
+        self.shared.close();
         if let Some(host) = self.host() {
             host.close_browser(1);
         }

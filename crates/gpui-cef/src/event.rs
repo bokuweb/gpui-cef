@@ -44,4 +44,48 @@ pub enum WebviewEvent {
         /// Where it would have gone.
         url: String,
     },
+
+    /// The page opened a JavaScript dialog and is waiting for the answer. Show
+    /// something, then pass the answer to
+    /// [`Webview::resolve_dialog`](crate::Webview::resolve_dialog).
+    ///
+    /// Until then the page's script is blocked; see
+    /// [`DialogPolicy`](crate::DialogPolicy). macOS (CEF) only.
+    #[non_exhaustive]
+    JsDialog {
+        /// What to answer by.
+        id: DialogId,
+        /// Which dialog it is.
+        kind: JsDialogKind,
+        /// What the page wants to say. For the "leave this page?" dialog it is
+        /// the browser's own wording, since pages no longer get to choose it.
+        message: String,
+        /// The text a `prompt()` starts out with. Empty for the others.
+        default_prompt: String,
+        /// The page that asked, for showing whose dialog this is. Empty for the
+        /// "leave this page?" dialog.
+        origin_url: String,
+    },
 }
+
+/// Which JavaScript dialog a [`WebviewEvent::JsDialog`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsDialogKind {
+    /// `alert()`: a message and an OK button.
+    Alert,
+    /// `confirm()`: OK or Cancel. Accepting makes it return `true`.
+    Confirm,
+    /// `prompt()`: a line of text. Accepting makes it return the text, and
+    /// cancelling makes it return `null`.
+    Prompt,
+    /// The "leave this page?" dialog a `beforeunload` handler asks for.
+    /// Accepting leaves the page; cancelling stays.
+    BeforeUnload {
+        /// Whether the page is being reloaded rather than left.
+        is_reload: bool,
+    },
+}
+
+/// Identifies a [`WebviewEvent::JsDialog`] to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DialogId(pub(crate) u64);

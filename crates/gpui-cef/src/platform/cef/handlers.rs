@@ -11,8 +11,10 @@ use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
-use super::shared::{Frame as SharedFrame, Shared};
-use crate::{NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions};
+use super::shared::{Frame as SharedFrame, JsDialogReply, Shared};
+use crate::{
+    DialogPolicy, JsDialogKind, NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions,
+};
 
 /// Settings carried by `cef::App`.
 #[derive(Clone)]
@@ -529,6 +531,97 @@ wrap_request_handler! {
     }
 }
 
+wrap_jsdialog_handler! {
+    pub(crate) struct GpuiCefJsDialogHandler {
+        state: PageState,
+    }
+
+    impl JsdialogHandler {
+        /// `alert`, `confirm` and `prompt`. A windowless browser has no dialog
+        /// of its own, so the application answers — see [`DialogPolicy`].
+        fn on_jsdialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            dialog_type: JsdialogType,
+            message_text: Option<&CefString>,
+            default_prompt_text: Option<&CefString>,
+            callback: Option<&mut JsdialogCallback>,
+            suppress_message: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(kind), Some(callback)) = (js_dialog_kind(dialog_type), callback) else {
+                return 0;
+            };
+            if self.state.options.js_dialogs == DialogPolicy::AutoDismiss
+                || self.state.shared.is_closed()
+            {
+                // Suppressing, which CEF prefers to answering at once: alert
+                // returns, confirm returns false and prompt null.
+                if let Some(suppress) = suppress_message {
+                    *suppress = 1;
+                }
+                return 0;
+            }
+            let id = self.state.shared.add_js_dialog(JsDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::JsDialog {
+                id,
+                kind,
+                message: string(message_text),
+                default_prompt: string(default_prompt_text),
+                origin_url: string(origin_url),
+            });
+            1
+        }
+
+        /// The "leave this page?" dialog a `beforeunload` handler asks for.
+        fn on_before_unload_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_text: Option<&CefString>,
+            is_reload: ::std::os::raw::c_int,
+            callback: Option<&mut JsdialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            if self.state.options.js_dialogs == DialogPolicy::AutoDismiss
+                || self.state.shared.is_closed()
+            {
+                // Leave: staying would make the navigation hang on a question
+                // nobody is going to answer.
+                callback.cont(1, None);
+                return 1;
+            }
+            let id = self.state.shared.add_js_dialog(JsDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::JsDialog {
+                id,
+                kind: JsDialogKind::BeforeUnload {
+                    is_reload: is_reload != 0,
+                },
+                message: string(message_text),
+                default_prompt: String::new(),
+                origin_url: String::new(),
+            });
+            1
+        }
+
+        /// The page moved on — navigated, say — so a dialog still waiting no
+        /// longer means anything.
+        fn on_reset_dialog_state(&self, _browser: Option<&mut Browser>) {
+            self.state.shared.cancel_js_dialogs();
+        }
+    }
+}
+
+fn js_dialog_kind(dialog_type: JsdialogType) -> Option<JsDialogKind> {
+    match dialog_type {
+        JsdialogType::ALERT => Some(JsDialogKind::Alert),
+        JsdialogType::CONFIRM => Some(JsDialogKind::Confirm),
+        JsdialogType::PROMPT => Some(JsDialogKind::Prompt),
+        _ => None,
+    }
+}
+
 /// Whether a navigation was meant for a new tab or window rather than this
 /// one.
 fn opens_new_window(disposition: WindowOpenDisposition) -> bool {
@@ -553,6 +646,7 @@ wrap_client! {
         load_handler: LoadHandler,
         life_span_handler: LifeSpanHandler,
         request_handler: RequestHandler,
+        jsdialog_handler: JsdialogHandler,
     }
 
     impl Client {
@@ -575,6 +669,10 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
         }
+
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(self.jsdialog_handler.clone())
+        }
     }
 }
 
@@ -593,7 +691,8 @@ impl GpuiCefClient {
             }),
             GpuiCefLoadHandler::new(LoadState { shared }),
             GpuiCefLifeSpanHandler::new(page.clone()),
-            GpuiCefRequestHandler::new(page),
+            GpuiCefRequestHandler::new(page.clone()),
+            GpuiCefJsDialogHandler::new(page),
         )
     }
 }
@@ -626,6 +725,22 @@ mod tests {
         assert_eq!(
             cursor_style(CursorType::NORTHRESIZE),
             cursor_style(CursorType::SOUTHRESIZE)
+        );
+    }
+
+    #[test]
+    fn javascript_dialogs_map_to_their_kinds() {
+        assert_eq!(
+            js_dialog_kind(JsdialogType::ALERT),
+            Some(JsDialogKind::Alert)
+        );
+        assert_eq!(
+            js_dialog_kind(JsdialogType::CONFIRM),
+            Some(JsDialogKind::Confirm)
+        );
+        assert_eq!(
+            js_dialog_kind(JsdialogType::PROMPT),
+            Some(JsDialogKind::Prompt)
         );
     }
 

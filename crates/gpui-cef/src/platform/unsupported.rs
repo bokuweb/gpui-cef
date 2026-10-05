@@ -61,6 +61,15 @@ impl Webview {
     pub fn stop(&self) {}
     /// Runs JavaScript in the page (no-op).
     pub fn eval(&self, _script: &str) {}
+    /// Answers a JavaScript dialog. There never is one: always `false`.
+    pub fn resolve_dialog(
+        &self,
+        _id: crate::DialogId,
+        _accept: bool,
+        _text: Option<String>,
+    ) -> bool {
+        false
+    }
     /// The current page title. Always empty.
     pub fn title(&self) -> String {
         String::new()

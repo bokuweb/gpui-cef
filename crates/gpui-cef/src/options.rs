@@ -57,6 +57,10 @@ pub struct WebviewOptions {
     /// Decides whether each navigation may go ahead. `None`, the default,
     /// allows everything.
     pub navigation_filter: Option<NavigationFilter>,
+    /// What to do with `alert`, `confirm`, `prompt` and "leave this page?"
+    /// dialogs. By default each one becomes a [`crate::WebviewEvent::JsDialog`]
+    /// for the application to answer. macOS (CEF) only: WebView2 shows its own.
+    pub js_dialogs: DialogPolicy,
 }
 
 impl Default for WebviewOptions {
@@ -68,6 +72,7 @@ impl Default for WebviewOptions {
             accelerated: false,
             popups: PopupPolicy::default(),
             navigation_filter: None,
+            js_dialogs: DialogPolicy::default(),
         }
     }
 }
@@ -87,6 +92,7 @@ impl std::fmt::Debug for WebviewOptions {
                     .as_ref()
                     .map(|_| "Fn(&NavigationRequest) -> bool"),
             )
+            .field("js_dialogs", &self.js_dialogs)
             .finish()
     }
 }
@@ -118,6 +124,30 @@ pub enum PopupPolicy {
     Block,
     /// Load the URL in this webview instead, in place of the current page.
     LoadInPlace,
+}
+
+/// What a webview does with the page's JavaScript dialogs — `alert`,
+/// `confirm`, `prompt`, and the "leave this page?" dialog `beforeunload` asks
+/// for.
+///
+/// A windowless browser has no dialog of its own to show, so without an answer
+/// from somewhere the page cannot go on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogPolicy {
+    /// Emit [`crate::WebviewEvent::JsDialog`] and wait for
+    /// [`crate::Webview::resolve_dialog`].
+    ///
+    /// The page waits as long as it takes: `alert()` and friends block its
+    /// script until they are answered, so an application that never answers
+    /// leaves the page stuck. A dialog still waiting when the page navigates
+    /// away, or when the webview is dropped, is dismissed.
+    #[default]
+    Event,
+    /// Answer every dialog at once, as if the user pressed Cancel — `alert`
+    /// returns, `confirm` returns `false`, `prompt` returns `null` — except the
+    /// "leave this page?" dialog, which is allowed to leave so navigation never
+    /// gets stuck. No events.
+    AutoDismiss,
 }
 
 /// Decides whether a navigation may go ahead: `true` lets it through, `false`
