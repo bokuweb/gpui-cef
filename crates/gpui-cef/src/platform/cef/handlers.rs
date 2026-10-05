@@ -17,6 +17,8 @@ use crate::{
     NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions,
 };
 
+type Status = crate::TerminationStatus;
+
 /// Settings carried by `cef::App`.
 #[derive(Clone)]
 pub(crate) struct AppConfig {
@@ -373,21 +375,25 @@ wrap_load_handler! {
         fn on_load_error(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut cef::Frame>,
+            frame: Option<&mut cef::Frame>,
             error_code: Errorcode,
             error_text: Option<&CefString>,
             failed_url: Option<&CefString>,
         ) {
-            // ERR_ABORTED just means another navigation replaced this one.
-            if error_code == Errorcode::from(cef::sys::cef_errorcode_t::ERR_ABORTED) {
+            // ERR_ABORTED just means another navigation replaced this one, or
+            // the navigation filter turned it down.
+            if error_code == Errorcode::ABORTED {
                 return;
             }
-            log::warn!(
-                "failed to load {}: {} ({:?})",
-                failed_url.map(|url| url.to_string()).unwrap_or_default(),
-                error_text.map(|text| text.to_string()).unwrap_or_default(),
-                error_code,
-            );
+            let url = string(failed_url);
+            let error_text = string(error_text);
+            log::warn!("failed to load {url}: {error_text} ({error_code:?})");
+            self.state.shared.push_event(WebviewEvent::LoadFailed {
+                url,
+                error_code: *error_code.as_ref() as i32,
+                error_text,
+                is_main_frame: frame.is_none_or(|frame| frame.is_main() != 0),
+            });
         }
     }
 }
@@ -502,6 +508,27 @@ wrap_request_handler! {
             // Cancelled; CEF reports ERR_ABORTED to the load handler, which
             // leaves it out.
             1
+        }
+
+        /// The renderer died. The page is frozen on its last frame until the
+        /// application reloads it, so it has to hear about this.
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            log::error!("the render process terminated: {status:?} ({error_code})");
+            // Nothing is left to answer them.
+            self.state.shared.cancel_js_dialogs();
+            self.state
+                .shared
+                .push_event(WebviewEvent::RenderProcessTerminated {
+                    status: termination_status(status),
+                    error_code,
+                    error_text: string(error_string),
+                });
         }
 
         /// A link the user asked to open somewhere else — Cmd-click or
@@ -826,6 +853,17 @@ fn js_dialog_kind(dialog_type: JsdialogType) -> Option<JsDialogKind> {
     }
 }
 
+fn termination_status(status: TerminationStatus) -> Status {
+    match status {
+        TerminationStatus::PROCESS_WAS_KILLED => Status::Killed,
+        TerminationStatus::PROCESS_CRASHED => Status::Crashed,
+        TerminationStatus::PROCESS_OOM => Status::OutOfMemory,
+        TerminationStatus::LAUNCH_FAILED => Status::LaunchFailed,
+        TerminationStatus::INTEGRITY_FAILURE => Status::IntegrityFailure,
+        _ => Status::Abnormal,
+    }
+}
+
 /// Whether a navigation was meant for a new tab or window rather than this
 /// one.
 fn opens_new_window(disposition: WindowOpenDisposition) -> bool {
@@ -1027,6 +1065,26 @@ mod tests {
         assert_eq!(byte_count(1024), Some(1024));
         assert_eq!(byte_count(0), None);
         assert_eq!(byte_count(-1), None);
+    }
+
+    #[test]
+    fn termination_statuses_map_across() {
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_CRASHED),
+            Status::Crashed
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_WAS_KILLED),
+            Status::Killed
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_OOM),
+            Status::OutOfMemory
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::ABNORMAL_TERMINATION),
+            Status::Abnormal
+        );
     }
 
     #[test]

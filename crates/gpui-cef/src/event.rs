@@ -128,6 +128,60 @@ pub enum WebviewEvent {
         /// Where it is being written, once that is decided.
         path: Option<std::path::PathBuf>,
     },
+
+    /// The process rendering the page went away — it crashed, ran out of
+    /// memory, or was killed. The webview keeps showing the last frame and
+    /// stops responding; [`Webview::reload`](crate::Webview::reload) starts a
+    /// new process and brings the page back. Any JavaScript dialog it had open
+    /// is dismissed. macOS (CEF) only.
+    #[non_exhaustive]
+    RenderProcessTerminated {
+        /// How it ended.
+        status: TerminationStatus,
+        /// The exit code or signal, as Chromium's "Aw, Snap!" page would show
+        /// it.
+        error_code: i32,
+        /// Chromium's description of it, possibly empty.
+        error_text: String,
+    },
+
+    /// A page or frame failed to load: no network, a name that does not
+    /// resolve, a refused connection. A load cancelled by another navigation
+    /// or by [`WebviewOptions::navigation_filter`] is not a failure and is not
+    /// reported. macOS (CEF) only.
+    ///
+    /// [`WebviewOptions::navigation_filter`]: crate::WebviewOptions::navigation_filter
+    #[non_exhaustive]
+    LoadFailed {
+        /// What failed to load.
+        url: String,
+        /// Chromium's network error code, negative: `-105` is
+        /// `ERR_NAME_NOT_RESOLVED`, for instance.
+        error_code: i32,
+        /// The same as text, such as `ERR_NAME_NOT_RESOLVED`.
+        error_text: String,
+        /// Whether it was the page rather than an `<iframe>` inside it.
+        is_main_frame: bool,
+    },
+}
+
+/// How the process rendering a page ended, in
+/// [`WebviewEvent::RenderProcessTerminated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TerminationStatus {
+    /// It exited with an error.
+    Abnormal,
+    /// It was killed, by the OS or a task manager.
+    Killed,
+    /// It crashed.
+    Crashed,
+    /// It ran out of memory.
+    OutOfMemory,
+    /// It could not be started.
+    LaunchFailed,
+    /// Its code failed an integrity check.
+    IntegrityFailure,
 }
 
 /// Where a download stands, in a [`WebviewEvent::DownloadUpdated`].
