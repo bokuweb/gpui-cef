@@ -26,7 +26,7 @@ use wry::{
     NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
 
-use crate::{Error, PopupPolicy, RuntimeOptions, WebviewEvent, WebviewOptions};
+use crate::{Error, NavigationRequest, PopupPolicy, RuntimeOptions, WebviewEvent, WebviewOptions};
 
 /// The WebView2 runtime needs no process-wide setup, so [`Runtime`] holds
 /// nothing. It exists to match the macOS API.
@@ -118,6 +118,30 @@ impl Webview {
                 )
                 .into(),
             });
+
+        let builder = match options.navigation_filter.clone() {
+            Some(filter) => builder.with_navigation_handler({
+                let mailbox = mailbox.clone();
+                move |url| {
+                    // WebView2 only asks about the page, and wry passes on the
+                    // URL alone.
+                    let navigation = NavigationRequest {
+                        url,
+                        is_redirect: false,
+                        user_gesture: false,
+                        is_main_frame: true,
+                    };
+                    let allowed = crate::options::navigation_allowed(&filter, &navigation);
+                    if !allowed {
+                        mailbox.emit(WebviewEvent::NavigationBlocked {
+                            url: navigation.url,
+                        });
+                    }
+                    allowed
+                }
+            }),
+            None => builder,
+        };
 
         let webview = match builder.build_as_child(&window) {
             Ok(webview) => Some(webview),

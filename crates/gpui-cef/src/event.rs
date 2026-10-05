@@ -35,4 +35,13 @@ pub enum WebviewEvent {
         /// the page opening it on its own. Always `false` with WebView2.
         user_gesture: bool,
     },
+
+    /// [`WebviewOptions::navigation_filter`] turned a navigation down.
+    ///
+    /// [`WebviewOptions::navigation_filter`]: crate::WebviewOptions::navigation_filter
+    #[non_exhaustive]
+    NavigationBlocked {
+        /// Where it would have gone.
+        url: String,
+    },
 }

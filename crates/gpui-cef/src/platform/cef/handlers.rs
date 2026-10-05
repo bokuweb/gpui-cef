@@ -12,7 +12,7 @@ use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
 use super::shared::{Frame as SharedFrame, Shared};
-use crate::{PopupPolicy, WebviewEvent, WebviewOptions};
+use crate::{NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions};
 
 /// Settings carried by `cef::App`.
 #[derive(Clone)]
@@ -469,6 +469,38 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        /// Every navigation, of the page and of its frames, passes through
+        /// [`crate::WebviewOptions::navigation_filter`] here.
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut cef::Frame>,
+            request: Option<&mut Request>,
+            user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(filter) = &self.state.options.navigation_filter else {
+                return 0;
+            };
+            let navigation = NavigationRequest {
+                url: request
+                    .map(|request| CefString::from(&request.url()).to_string())
+                    .unwrap_or_default(),
+                is_redirect: is_redirect != 0,
+                user_gesture: user_gesture != 0,
+                is_main_frame: frame.is_none_or(|frame| frame.is_main() != 0),
+            };
+            if crate::options::navigation_allowed(filter, &navigation) {
+                return 0;
+            }
+            self.state
+                .shared
+                .push_event(WebviewEvent::NavigationBlocked { url: navigation.url });
+            // Cancelled; CEF reports ERR_ABORTED to the load handler, which
+            // leaves it out.
+            1
+        }
+
         /// A link the user asked to open somewhere else — Cmd-click or
         /// middle-click. Left alone, Chromium would load it here; it goes
         /// through [`PopupPolicy`] like any other new window instead.

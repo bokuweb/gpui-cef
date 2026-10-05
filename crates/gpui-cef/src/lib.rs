@@ -46,7 +46,10 @@ mod options;
 mod platform;
 
 pub use event::WebviewEvent;
-pub use options::{CookieSpec, PopupPolicy, RuntimeOptions, SameSite, WebviewOptions};
+pub use options::{
+    CookieSpec, NavigationFilter, NavigationRequest, PopupPolicy, RuntimeOptions, SameSite,
+    WebviewOptions,
+};
 pub use platform::{init, Runtime, Webview};
 
 /// What a console line starts with when it is a message for the application.

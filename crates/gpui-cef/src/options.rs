@@ -26,7 +26,7 @@ impl Default for RuntimeOptions {
 }
 
 /// Settings for a single webview.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebviewOptions {
     /// The URL to open first.
     pub url: String,
@@ -54,6 +54,9 @@ pub struct WebviewOptions {
     /// What to do when the page asks for a new window. Blocked by default, with
     /// a [`crate::WebviewEvent::PopupRequested`] for the application.
     pub popups: PopupPolicy,
+    /// Decides whether each navigation may go ahead. `None`, the default,
+    /// allows everything.
+    pub navigation_filter: Option<NavigationFilter>,
 }
 
 impl Default for WebviewOptions {
@@ -64,7 +67,27 @@ impl Default for WebviewOptions {
             frame_rate: 60,
             accelerated: false,
             popups: PopupPolicy::default(),
+            navigation_filter: None,
         }
+    }
+}
+
+impl std::fmt::Debug for WebviewOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebviewOptions")
+            .field("url", &self.url)
+            .field("transparent", &self.transparent)
+            .field("frame_rate", &self.frame_rate)
+            .field("accelerated", &self.accelerated)
+            .field("popups", &self.popups)
+            .field(
+                "navigation_filter",
+                &self
+                    .navigation_filter
+                    .as_ref()
+                    .map(|_| "Fn(&NavigationRequest) -> bool"),
+            )
+            .finish()
     }
 }
 
@@ -97,6 +120,44 @@ pub enum PopupPolicy {
     LoadInPlace,
 }
 
+/// Decides whether a navigation may go ahead: `true` lets it through, `false`
+/// cancels it and emits [`crate::WebviewEvent::NavigationBlocked`].
+///
+/// It is asked about every navigation, including the first URL and
+/// [`crate::Webview::load_url`], and it is called synchronously from inside
+/// the browser engine — so keep it quick, and do not reach back into the
+/// webview from it. A filter that panics counts as a refusal.
+pub type NavigationFilter = std::sync::Arc<dyn Fn(&NavigationRequest) -> bool + Send + Sync>;
+
+/// A navigation about to happen, as a [`NavigationFilter`] sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NavigationRequest {
+    /// Where it is going.
+    pub url: String,
+    /// Whether this is a server redirect of a navigation already under way.
+    /// Always `false` with WebView2.
+    pub is_redirect: bool,
+    /// Whether the user started it — clicked a link, say — rather than the
+    /// page or the application. Always `false` with WebView2.
+    pub user_gesture: bool,
+    /// Whether it is the page itself rather than an `<iframe>` inside it.
+    /// Always `true` with WebView2, which only asks about the page.
+    pub is_main_frame: bool,
+}
+
+/// Asks `filter` about `request`, treating a panic as a refusal: it would
+/// otherwise unwind into the browser engine and abort the process.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub(crate) fn navigation_allowed(filter: &NavigationFilter, request: &NavigationRequest) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter(request))).unwrap_or_else(
+        |_| {
+            log::error!("the navigation filter panicked; blocking {}", request.url);
+            false
+        },
+    )
+}
+
 /// A cookie to put in the browser's store, for [`crate::Runtime::set_cookies`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieSpec {
@@ -124,4 +185,52 @@ pub enum SameSite {
     None,
     Lax,
     Strict,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(url: &str) -> NavigationRequest {
+        NavigationRequest {
+            url: url.into(),
+            is_redirect: false,
+            user_gesture: true,
+            is_main_frame: true,
+        }
+    }
+
+    #[test]
+    fn the_filter_decides() {
+        let filter: NavigationFilter =
+            std::sync::Arc::new(|request| !request.url.contains("blocked"));
+        assert!(navigation_allowed(
+            &filter,
+            &request("https://example.com/")
+        ));
+        assert!(!navigation_allowed(
+            &filter,
+            &request("https://blocked.example/")
+        ));
+    }
+
+    #[test]
+    fn a_panicking_filter_blocks_instead_of_unwinding() {
+        let filter: NavigationFilter = std::sync::Arc::new(|_| panic!("bug in the filter"));
+        assert!(!navigation_allowed(
+            &filter,
+            &request("https://example.com/")
+        ));
+    }
+
+    #[test]
+    fn options_print_without_their_closures() {
+        let options = WebviewOptions {
+            navigation_filter: Some(std::sync::Arc::new(|_| true)),
+            ..WebviewOptions::url("https://example.com/")
+        };
+        let printed = format!("{options:?}");
+        assert!(printed.contains("https://example.com/"));
+        assert!(printed.contains("navigation_filter: Some"));
+    }
 }
