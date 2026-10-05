@@ -14,6 +14,8 @@ use std::{
 use cef::{Browser, BrowserHost, ImplBrowser};
 use gpui::{px, size, Bounds, CursorStyle, Pixels, RenderImage, Size};
 
+use crate::WebviewEvent;
+
 /// The most recent frame handed over by CEF.
 pub(crate) enum Frame {
     /// From `on_accelerated_paint`: a GPU texture referenced in place.
@@ -93,8 +95,10 @@ pub(crate) struct Shared {
     /// The browser, kept here so the message pump can reach `BrowserHost`
     /// without borrowing gpui's `App`.
     browser: RefCell<Option<Browser>>,
-    /// Messages the page posted, waiting for the pump to emit them.
-    messages: RefCell<Vec<String>>,
+    /// Events waiting for the pump to emit them. CEF's callbacks run inside
+    /// `do_message_loop_work()`, where gpui cannot be reached, so they queue
+    /// here instead.
+    events: RefCell<Vec<WebviewEvent>>,
 }
 
 impl Shared {
@@ -120,19 +124,19 @@ impl Shared {
             composition_bounds: RefCell::new(Vec::new()),
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
-            messages: RefCell::new(Vec::new()),
+            events: RefCell::new(Vec::new()),
         })
     }
 
-    /// Queue a message the page posted; the pump emits it on its next pass.
-    pub(crate) fn push_message(&self, message: String) {
-        self.messages.borrow_mut().push(message);
+    /// Queue an event for the application; the pump emits it on its next pass.
+    pub(crate) fn push_event(&self, event: WebviewEvent) {
+        self.events.borrow_mut().push(event);
         self.dirty.set(true);
     }
 
-    /// The messages posted since the last call.
-    pub(crate) fn take_messages(&self) -> Vec<String> {
-        std::mem::take(&mut *self.messages.borrow_mut())
+    /// The events queued since the last call, oldest first.
+    pub(crate) fn take_events(&self) -> Vec<WebviewEvent> {
+        std::mem::take(&mut *self.events.borrow_mut())
     }
 
     /// Called from gpui's prepaint. Raises `resized` when the size changed.
@@ -450,6 +454,25 @@ mod tests {
         assert!(shared.can_go_back());
         assert!(!shared.can_go_forward());
         assert!(shared.take_dirty());
+    }
+
+    #[test]
+    fn events_come_out_once_and_in_order() {
+        let shared = Shared::new("about:blank".into());
+        shared.take_dirty();
+
+        shared.push_event(WebviewEvent::Message("first".into()));
+        shared.push_event(WebviewEvent::Message("second".into()));
+        // The pump only looks at a view that says something changed.
+        assert!(shared.take_dirty());
+        assert_eq!(
+            shared.take_events(),
+            [
+                WebviewEvent::Message("first".into()),
+                WebviewEvent::Message("second".into())
+            ]
+        );
+        assert!(shared.take_events().is_empty());
     }
 
     #[test]

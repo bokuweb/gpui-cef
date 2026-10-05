@@ -187,7 +187,7 @@ fn tick_view(view: &View) {
     }
 
     let stale = view.shared.take_stale_cpu_frames();
-    let messages = view.shared.take_messages();
+    let events = view.shared.take_events();
     let dirty = view.shared.take_dirty();
     if stale.is_empty() && !dirty {
         return;
@@ -199,8 +199,8 @@ fn tick_view(view: &View) {
         for frame in stale {
             cx.drop_image(frame, None);
         }
-        for message in messages {
-            cx.emit(crate::WebviewEvent::Message(message));
+        for event in events {
+            cx.emit(event);
         }
         if dirty {
             cx.notify();

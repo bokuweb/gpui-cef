@@ -67,15 +67,15 @@ pub struct Webview {
     url: String,
     /// Whether a page is loading, updated from wry's page load callback.
     is_loading: Rc<Cell<bool>>,
-    /// Messages that arrived while gpui was busy, emitted on the next render.
-    inbox: Rc<RefCell<Vec<String>>>,
+    /// Events that arrived while gpui was busy, emitted on the next render.
+    inbox: Rc<RefCell<Vec<crate::WebviewEvent>>>,
 }
 
 impl Webview {
     /// Creates the webview and starts loading the first page.
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: WebviewOptions) -> Self {
         let is_loading = Rc::new(Cell::new(true));
-        let inbox: Rc<RefCell<Vec<String>>> = Rc::default();
+        let inbox: Rc<RefCell<Vec<crate::WebviewEvent>>> = Rc::default();
         let entity = cx.weak_entity();
         let app = cx.to_async();
 
@@ -88,16 +88,14 @@ impl Webview {
             .with_ipc_handler({
                 let inbox = inbox.clone();
                 move |request| {
-                    let message = request.body().clone();
+                    let event = crate::WebviewEvent::Message(request.body().clone());
                     // WebView2 calls back from the message loop, where gpui is
-                    // normally not mid-update; when it is, the message waits for
+                    // normally not mid-update; when it is, the event waits for
                     // the next render.
                     let mut app = app.clone();
-                    let emitted = entity.update(&mut app, |_, cx| {
-                        cx.emit(crate::WebviewEvent::Message(message.clone()));
-                    });
+                    let emitted = entity.update(&mut app, |_, cx| cx.emit(event.clone()));
                     if emitted.is_err() {
-                        inbox.borrow_mut().push(message);
+                        inbox.borrow_mut().push(event);
                     }
                 }
             })
@@ -264,8 +262,8 @@ impl gpui::Focusable for Webview {
 
 impl Render for Webview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for message in std::mem::take(&mut *self.inbox.borrow_mut()) {
-            cx.emit(crate::WebviewEvent::Message(message));
+        for event in std::mem::take(&mut *self.inbox.borrow_mut()) {
+            cx.emit(event);
         }
         div()
             .track_focus(&self.focus_handle)

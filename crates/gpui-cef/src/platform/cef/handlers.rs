@@ -277,7 +277,9 @@ wrap_display_handler! {
             };
             match crate::message_payload(&message) {
                 Some(payload) => {
-                    self.state.shared.push_message(payload.to_string());
+                    self.state
+                        .shared
+                        .push_event(crate::WebviewEvent::Message(payload.to_string()));
                     1
                 }
                 None => 0,

@@ -41,23 +41,13 @@
 // around it is the whole point.
 #![allow(clippy::needless_doctest_main)]
 
+mod event;
 mod options;
 mod platform;
 
+pub use event::WebviewEvent;
 pub use options::{CookieSpec, RuntimeOptions, SameSite, WebviewOptions};
 pub use platform::{init, Runtime, Webview};
-
-/// What a [`Webview`] reports to the application, through
-/// [`gpui::EventEmitter`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WebviewEvent {
-    /// A message the page posted with the script [`post_message_script`]
-    /// returns.
-    ///
-    /// Untrusted: any script running in the page can post one, so treat it as
-    /// input from the page, not from the application.
-    Message(String),
-}
 
 /// What a console line starts with when it is a message for the application.
 /// The page never needs to spell it out: [`post_message_script`] does.
