@@ -15,7 +15,11 @@
 //! Input goes straight to WebView2, so none of the CEF backend's event
 //! forwarding is needed.
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+};
 
 use gpui::{
     div, prelude::*, App, AsyncApp, Bounds, Context, Element, ElementId, GlobalElementId,
@@ -26,7 +30,10 @@ use wry::{
     NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
 
-use crate::{Error, NavigationRequest, PopupPolicy, RuntimeOptions, WebviewEvent, WebviewOptions};
+use crate::{
+    DownloadId, DownloadState, Error, NavigationRequest, PopupPolicy, RuntimeOptions, WebviewEvent,
+    WebviewOptions,
+};
 
 /// The WebView2 runtime needs no process-wide setup, so [`Runtime`] holds
 /// nothing. It exists to match the macOS API.
@@ -70,6 +77,7 @@ impl Webview {
     /// Creates the webview and starts loading the first page.
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: WebviewOptions) -> Self {
         let is_loading = Rc::new(Cell::new(true));
+        let downloads = Rc::new(DownloadIds::default());
         let mailbox = Mailbox {
             entity: cx.weak_entity(),
             app: cx.to_async(),
@@ -102,6 +110,50 @@ impl Webview {
                         PopupPolicy::LoadInPlace => {}
                     }
                     NewWindowResponse::Deny
+                }
+            })
+            .with_download_started_handler({
+                let mailbox = mailbox.clone();
+                let downloads = downloads.clone();
+                move |url, path| {
+                    let id = downloads.start(&url);
+                    mailbox.emit(WebviewEvent::DownloadRequested {
+                        id,
+                        suggested_name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        url,
+                        mime_type: String::new(),
+                        total_bytes: None,
+                    });
+                    // WebView2 wants the answer now, so the download goes to
+                    // the folder it picked; the event is a notice.
+                    true
+                }
+            })
+            .with_download_completed_handler({
+                let mailbox = mailbox.clone();
+                let downloads = downloads.clone();
+                move |url, path, success| {
+                    let Some(id) = downloads.finish(&url) else {
+                        return;
+                    };
+                    let size = path
+                        .as_deref()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .map(|metadata| metadata.len());
+                    mailbox.emit(WebviewEvent::DownloadUpdated {
+                        id,
+                        state: if success {
+                            DownloadState::Completed
+                        } else {
+                            DownloadState::Failed
+                        },
+                        received_bytes: size.unwrap_or(0),
+                        total_bytes: size,
+                        path,
+                    });
                 }
             })
             .with_on_page_load_handler({
@@ -222,6 +274,14 @@ impl Webview {
         false
     }
 
+    /// WebView2 decides where a download goes before
+    /// [`WebviewEvent::DownloadRequested`] is emitted — its default folder,
+    /// usually the user's Downloads — so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_download(&self, _id: DownloadId, _path: Option<PathBuf>) -> bool {
+        false
+    }
+
     /// Whether a page is currently loading.
     pub fn is_loading(&self) -> bool {
         self.is_loading.get()
@@ -286,6 +346,29 @@ impl Webview {
             )
             .into(),
         });
+    }
+}
+
+/// Numbers WebView2's downloads. wry reports a download's start and its end
+/// by URL alone, so the two are matched up by URL, oldest first.
+#[derive(Default)]
+struct DownloadIds {
+    next: Cell<u64>,
+    running: RefCell<Vec<(String, u64)>>,
+}
+
+impl DownloadIds {
+    fn start(&self, url: &str) -> DownloadId {
+        let id = self.next.get() + 1;
+        self.next.set(id);
+        self.running.borrow_mut().push((url.to_string(), id));
+        DownloadId(id)
+    }
+
+    fn finish(&self, url: &str) -> Option<DownloadId> {
+        let mut running = self.running.borrow_mut();
+        let index = running.iter().position(|(running, _)| running == url)?;
+        Some(DownloadId(running.remove(index).1))
     }
 }
 

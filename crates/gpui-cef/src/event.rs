@@ -90,7 +90,62 @@ pub enum WebviewEvent {
         /// nothing is known.
         accept_extensions: Vec<String>,
     },
+
+    /// The page started a download — a link with `download`, a response the
+    /// server marked as an attachment, a `blob:` URL the page built. Say where
+    /// it goes with [`Webview::resolve_download`](crate::Webview::resolve_download),
+    /// or cancel it; until then it waits. Progress follows as
+    /// [`WebviewEvent::DownloadUpdated`].
+    ///
+    /// With WebView2 this is a notice rather than a question: WebView2 has
+    /// already saved it to its default folder, usually the user's Downloads.
+    #[non_exhaustive]
+    DownloadRequested {
+        /// What to answer by. Updates carry the same id.
+        id: DownloadId,
+        /// Where it comes from. A `blob:` or `data:` URL when the page made it.
+        url: String,
+        /// The file name the page or the server suggested.
+        suggested_name: String,
+        /// Its MIME type, when known. Always empty with WebView2.
+        mime_type: String,
+        /// Its size, when known.
+        total_bytes: Option<u64>,
+    },
+
+    /// How a download is getting on. Updates to the same download are
+    /// coalesced while it is in progress, so not every chunk is reported.
+    #[non_exhaustive]
+    DownloadUpdated {
+        /// The download, as [`WebviewEvent::DownloadRequested`] named it.
+        id: DownloadId,
+        /// Where it stands.
+        state: DownloadState,
+        /// How much has arrived.
+        received_bytes: u64,
+        /// Its size, when known.
+        total_bytes: Option<u64>,
+        /// Where it is being written, once that is decided.
+        path: Option<std::path::PathBuf>,
+    },
 }
+
+/// Where a download stands, in a [`WebviewEvent::DownloadUpdated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    /// Still arriving.
+    InProgress,
+    /// All of it is on disk.
+    Completed,
+    /// Cancelled, by the application or the browser. Nothing more will come.
+    Canceled,
+    /// Stopped by an error, such as a dropped connection.
+    Failed,
+}
+
+/// Identifies a download, from [`WebviewEvent::DownloadRequested`] on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DownloadId(pub(crate) u64);
 
 /// What a [`WebviewEvent::FileDialog`] asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -78,6 +78,14 @@ impl Webview {
     ) -> bool {
         false
     }
+    /// Answers a download. There never is one: always `false`.
+    pub fn resolve_download(
+        &self,
+        _id: crate::DownloadId,
+        _path: Option<std::path::PathBuf>,
+    ) -> bool {
+        false
+    }
     /// The current page title. Always empty.
     pub fn title(&self) -> String {
         String::new()

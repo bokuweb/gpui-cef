@@ -45,7 +45,9 @@ mod event;
 mod options;
 mod platform;
 
-pub use event::{DialogId, FileDialogId, FileDialogMode, JsDialogKind, WebviewEvent};
+pub use event::{
+    DialogId, DownloadId, DownloadState, FileDialogId, FileDialogMode, JsDialogKind, WebviewEvent,
+};
 pub use options::{
     CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PopupPolicy, RuntimeOptions,
     SameSite, WebviewOptions,

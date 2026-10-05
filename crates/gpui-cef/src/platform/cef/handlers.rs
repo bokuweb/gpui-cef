@@ -13,8 +13,8 @@ use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
 use super::shared::{FileDialogReply, Frame as SharedFrame, JsDialogReply, Shared};
 use crate::{
-    DialogPolicy, FileDialogMode as Mode, JsDialogKind, NavigationRequest, PopupPolicy,
-    WebviewEvent, WebviewOptions,
+    DialogPolicy, DownloadId, DownloadState, FileDialogMode as Mode, JsDialogKind,
+    NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions,
 };
 
 /// Settings carried by `cef::App`.
@@ -661,6 +661,102 @@ wrap_dialog_handler! {
     }
 }
 
+wrap_download_handler! {
+    pub(crate) struct GpuiCefDownloadHandler {
+        state: PageState,
+    }
+
+    impl DownloadHandler {
+        /// Lets every download through to `on_before_download`, which is
+        /// where the application decides. CEF's own default says yes too,
+        /// but a method left out of a cef-rs handler answers 0 — no.
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> ::std::os::raw::c_int {
+            1
+        }
+
+        /// A download is starting and CEF wants to know where it goes. The
+        /// application says, through `Webview::resolve_download`.
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return 0;
+            };
+            // CEF says not to keep the item, so read what is needed now.
+            let id = item.id();
+            if !self.state.shared.add_download(id, callback.clone()) {
+                return 1;
+            }
+            self.state.shared.push_event(WebviewEvent::DownloadRequested {
+                id: DownloadId(id.into()),
+                url: CefString::from(&item.url()).to_string(),
+                suggested_name: string(suggested_name),
+                mime_type: CefString::from(&item.mime_type()).to_string(),
+                total_bytes: byte_count(item.total_bytes()),
+            });
+            // Returning 1 means the callback will be called, later.
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return;
+            };
+            let state = download_state(
+                item.is_complete() != 0,
+                item.is_canceled() != 0,
+                item.is_interrupted() != 0,
+            );
+            let finished = matches!(state, DownloadState::Completed | DownloadState::Canceled);
+            let id = item.id();
+            if !self.state.shared.update_download(id, callback.clone(), finished) {
+                return;
+            }
+            let path = CefString::from(&item.full_path()).to_string();
+            self.state.shared.push_event(WebviewEvent::DownloadUpdated {
+                id: DownloadId(id.into()),
+                state,
+                received_bytes: byte_count(item.received_bytes()).unwrap_or(0),
+                total_bytes: byte_count(item.total_bytes()),
+                path: Some(path).filter(|path| !path.is_empty()).map(Into::into),
+            });
+        }
+    }
+}
+
+/// Where a download stands, from CEF's flags. An interrupted download may
+/// still resume, so it is not taken as finished.
+fn download_state(complete: bool, canceled: bool, interrupted: bool) -> DownloadState {
+    if complete {
+        DownloadState::Completed
+    } else if canceled {
+        DownloadState::Canceled
+    } else if interrupted {
+        DownloadState::Failed
+    } else {
+        DownloadState::InProgress
+    }
+}
+
+/// A byte count CEF reports, which is negative or zero when unknown.
+fn byte_count(bytes: i64) -> Option<u64> {
+    u64::try_from(bytes).ok().filter(|bytes| *bytes > 0)
+}
+
 fn file_dialog_mode(mode: FileDialogMode) -> Option<Mode> {
     match mode {
         FileDialogMode::OPEN => Some(Mode::Open),
@@ -747,15 +843,35 @@ fn string(value: Option<&CefString>) -> String {
     value.map(ToString::to_string).unwrap_or_default()
 }
 
+/// The handlers that act on the application's behalf, built from one
+/// [`PageState`].
+#[derive(Clone)]
+pub(crate) struct PageHandlers {
+    life_span: LifeSpanHandler,
+    request: RequestHandler,
+    js_dialog: JsdialogHandler,
+    dialog: DialogHandler,
+    download: DownloadHandler,
+}
+
+impl PageHandlers {
+    fn new(page: PageState) -> Self {
+        Self {
+            life_span: GpuiCefLifeSpanHandler::new(page.clone()),
+            request: GpuiCefRequestHandler::new(page.clone()),
+            js_dialog: GpuiCefJsDialogHandler::new(page.clone()),
+            dialog: GpuiCefDialogHandler::new(page.clone()),
+            download: GpuiCefDownloadHandler::new(page),
+        }
+    }
+}
+
 wrap_client! {
     pub(crate) struct GpuiCefClient {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
-        life_span_handler: LifeSpanHandler,
-        request_handler: RequestHandler,
-        jsdialog_handler: JsdialogHandler,
-        dialog_handler: DialogHandler,
+        page: PageHandlers,
     }
 
     impl Client {
@@ -772,19 +888,23 @@ wrap_client! {
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(self.life_span_handler.clone())
+            Some(self.page.life_span.clone())
         }
 
         fn request_handler(&self) -> Option<RequestHandler> {
-            Some(self.request_handler.clone())
+            Some(self.page.request.clone())
         }
 
         fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
-            Some(self.jsdialog_handler.clone())
+            Some(self.page.js_dialog.clone())
         }
 
         fn dialog_handler(&self) -> Option<DialogHandler> {
-            Some(self.dialog_handler.clone())
+            Some(self.page.dialog.clone())
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(self.page.download.clone())
         }
     }
 }
@@ -803,10 +923,7 @@ impl GpuiCefClient {
                 shared: shared.clone(),
             }),
             GpuiCefLoadHandler::new(LoadState { shared }),
-            GpuiCefLifeSpanHandler::new(page.clone()),
-            GpuiCefRequestHandler::new(page.clone()),
-            GpuiCefJsDialogHandler::new(page.clone()),
-            GpuiCefDialogHandler::new(page),
+            PageHandlers::new(page),
         )
     }
 }
@@ -890,6 +1007,26 @@ mod tests {
             ["txt"]
         );
         assert!(accept_extensions_of(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn download_states_follow_cefs_flags() {
+        assert_eq!(
+            download_state(false, false, false),
+            DownloadState::InProgress
+        );
+        assert_eq!(download_state(true, false, false), DownloadState::Completed);
+        assert_eq!(download_state(false, true, false), DownloadState::Canceled);
+        assert_eq!(download_state(false, false, true), DownloadState::Failed);
+        // Cancelling interrupts too; cancelled is what it is.
+        assert_eq!(download_state(false, true, true), DownloadState::Canceled);
+    }
+
+    #[test]
+    fn unknown_sizes_are_none() {
+        assert_eq!(byte_count(1024), Some(1024));
+        assert_eq!(byte_count(0), None);
+        assert_eq!(byte_count(-1), None);
     }
 
     #[test]

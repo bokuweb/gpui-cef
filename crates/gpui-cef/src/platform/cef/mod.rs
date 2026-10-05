@@ -422,6 +422,20 @@ impl Webview {
         self.shared.resolve_file_dialog(id, paths.as_deref())
     }
 
+    /// Answers a [`crate::WebviewEvent::DownloadRequested`]: the full path to
+    /// write the file to, including its name, or `None` to cancel. The
+    /// download waits until this is called; one still waiting when the
+    /// webview is dropped is cancelled.
+    ///
+    /// Returns `false` when it is not waiting for an answer.
+    pub fn resolve_download(
+        &self,
+        id: crate::DownloadId,
+        path: Option<std::path::PathBuf>,
+    ) -> bool {
+        self.shared.resolve_download(id, path.as_deref())
+    }
+
     fn host(&self) -> Option<BrowserHost> {
         self.browser.as_ref().and_then(|b| b.host())
     }
