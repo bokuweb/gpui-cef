@@ -282,6 +282,15 @@ impl Webview {
         false
     }
 
+    /// Not with WebView2 yet: wry does not reach its `PrintToPdf`.
+    pub fn print_to_pdf(
+        &self,
+        _path: impl Into<PathBuf>,
+        _options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        Err(Error::Unsupported("printing to PDF with WebView2"))
+    }
+
     /// Whether a page is currently loading.
     pub fn is_loading(&self) -> bool {
         self.is_loading.get()

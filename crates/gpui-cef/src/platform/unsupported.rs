@@ -86,6 +86,14 @@ impl Webview {
     ) -> bool {
         false
     }
+    /// Printing needs a browser, which this platform does not have.
+    pub fn print_to_pdf(
+        &self,
+        _path: impl Into<std::path::PathBuf>,
+        _options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported("printing to PDF"))
+    }
     /// The current page title. Always empty.
     pub fn title(&self) -> String {
         String::new()

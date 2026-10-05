@@ -436,6 +436,33 @@ impl Webview {
         self.shared.resolve_download(id, path.as_deref())
     }
 
+    /// Prints the page to a PDF file at `path`, and emits
+    /// [`crate::WebviewEvent::PdfPrinted`] when it is done.
+    ///
+    /// This is the way for the application to print a windowless browser.
+    /// `window.print()` in the page still works after a fashion — CEF puts the
+    /// system print panel up as a window of its own, not attached to the gpui
+    /// window, and the page's script waits until it is closed — but the
+    /// application has no say in it. A page that should print through the
+    /// application can post it a message instead.
+    pub fn print_to_pdf(
+        &self,
+        path: impl Into<std::path::PathBuf>,
+        options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        let host = self
+            .host()
+            .ok_or_else(|| Error::Backend("the browser was never created".into()))?;
+        let path = path.into();
+        let mut callback = handlers::GpuiCefPdfPrintCallback::new(self.shared.clone());
+        host.print_to_pdf(
+            Some(&path.to_string_lossy().as_ref().into()),
+            Some(&handlers::pdf_settings(options)),
+            Some(&mut callback),
+        );
+        Ok(())
+    }
+
     fn host(&self) -> Option<BrowserHost> {
         self.browser.as_ref().and_then(|b| b.host())
     }

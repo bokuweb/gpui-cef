@@ -14,7 +14,7 @@ use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 use super::shared::{FileDialogReply, Frame as SharedFrame, JsDialogReply, Shared};
 use crate::{
     DialogPolicy, DownloadId, DownloadState, FileDialogMode as Mode, JsDialogKind,
-    NavigationRequest, PopupPolicy, WebviewEvent, WebviewOptions,
+    NavigationRequest, PdfMargins, PdfOptions, PopupPolicy, WebviewEvent, WebviewOptions,
 };
 
 type Status = crate::TerminationStatus;
@@ -851,6 +851,54 @@ fn js_dialog_kind(dialog_type: JsdialogType) -> Option<JsDialogKind> {
         JsdialogType::PROMPT => Some(JsDialogKind::Prompt),
         _ => None,
     }
+}
+
+wrap_pdf_print_callback! {
+    pub(crate) struct GpuiCefPdfPrintCallback {
+        shared: Rc<Shared>,
+    }
+
+    impl PdfPrintCallback {
+        fn on_pdf_print_finished(&self, path: Option<&CefString>, ok: ::std::os::raw::c_int) {
+            self.shared.push_event(WebviewEvent::PdfPrinted {
+                path: string(path).into(),
+                ok: ok != 0,
+            });
+        }
+    }
+}
+
+/// [`PdfOptions`] in CEF's shape. Sizes are in inches on both sides.
+pub(crate) fn pdf_settings(options: &PdfOptions) -> PdfPrintSettings {
+    let (width, height) = options.paper_size.unwrap_or_default();
+    let (margin_type, [top, right, bottom, left]) = match options.margins {
+        PdfMargins::Default => (PdfPrintMarginType::DEFAULT, [0.; 4]),
+        PdfMargins::None => (PdfPrintMarginType::NONE, [0.; 4]),
+        PdfMargins::Custom {
+            top,
+            right,
+            bottom,
+            left,
+        } => (PdfPrintMarginType::CUSTOM, [top, right, bottom, left]),
+    };
+    let mut settings = PdfPrintSettings {
+        landscape: options.landscape.into(),
+        print_background: options.print_background.into(),
+        // Zero means "the default", for the paper as for the scale.
+        paper_width: width,
+        paper_height: height,
+        prefer_css_page_size: options.prefer_css_page_size.into(),
+        margin_type,
+        margin_top: top,
+        margin_right: right,
+        margin_bottom: bottom,
+        margin_left: left,
+        ..Default::default()
+    };
+    if let Some(ranges) = &options.page_ranges {
+        settings.page_ranges = ranges.as_str().into();
+    }
+    settings
 }
 
 fn termination_status(status: TerminationStatus) -> Status {

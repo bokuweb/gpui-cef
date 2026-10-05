@@ -188,6 +188,42 @@ pub(crate) fn navigation_allowed(filter: &NavigationFilter, request: &Navigation
     )
 }
 
+/// How [`crate::Webview::print_to_pdf`] lays the page out. The defaults are
+/// Chromium's: US Letter, portrait, default margins, no background graphics.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PdfOptions {
+    /// Print across the long edge of the paper.
+    pub landscape: bool,
+    /// Print background colours and images.
+    pub print_background: bool,
+    /// The paper size in inches, width by height. `None` is US Letter
+    /// (8.5 by 11).
+    pub paper_size: Option<(f64, f64)>,
+    /// Use the size a page sets with CSS `@page`, when it sets one.
+    pub prefer_css_page_size: bool,
+    /// The margins around each page.
+    pub margins: PdfMargins,
+    /// Which pages to print, such as `"1-3, 5"`. `None` prints them all.
+    pub page_ranges: Option<String>,
+}
+
+/// The margins in [`PdfOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PdfMargins {
+    /// Chromium's default, about 0.4 inches.
+    #[default]
+    Default,
+    /// No margins at all.
+    None,
+    /// These margins, in inches.
+    Custom {
+        top: f64,
+        right: f64,
+        bottom: f64,
+        left: f64,
+    },
+}
+
 /// A cookie to put in the browser's store, for [`crate::Runtime::set_cookies`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieSpec {

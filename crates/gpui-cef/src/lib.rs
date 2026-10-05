@@ -50,8 +50,8 @@ pub use event::{
     TerminationStatus, WebviewEvent,
 };
 pub use options::{
-    CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PopupPolicy, RuntimeOptions,
-    SameSite, WebviewOptions,
+    CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PdfMargins, PdfOptions,
+    PopupPolicy, RuntimeOptions, SameSite, WebviewOptions,
 };
 pub use platform::{init, Runtime, Webview};
 

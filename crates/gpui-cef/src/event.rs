@@ -163,6 +163,15 @@ pub enum WebviewEvent {
         /// Whether it was the page rather than an `<iframe>` inside it.
         is_main_frame: bool,
     },
+
+    /// [`Webview::print_to_pdf`](crate::Webview::print_to_pdf) is done.
+    #[non_exhaustive]
+    PdfPrinted {
+        /// Where the PDF was to be written.
+        path: std::path::PathBuf,
+        /// Whether it was.
+        ok: bool,
+    },
 }
 
 /// How the process rendering a page ended, in
