@@ -15,21 +15,18 @@
 //! Input goes straight to WebView2, so none of the CEF backend's event
 //! forwarding is needed.
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    div, prelude::*, App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
-    LayoutId, Pixels, Render, Style, Window,
+    div, prelude::*, App, AsyncApp, Bounds, Context, Element, ElementId, GlobalElementId,
+    InspectorElementId, LayoutId, Pixels, Render, Style, WeakEntity, Window,
 };
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
     PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
 
-use crate::{Error, RuntimeOptions, WebviewOptions};
+use crate::{Error, RuntimeOptions, WebviewEvent, WebviewOptions};
 
 /// The WebView2 runtime needs no process-wide setup, so [`Runtime`] holds
 /// nothing. It exists to match the macOS API.
@@ -67,17 +64,16 @@ pub struct Webview {
     url: String,
     /// Whether a page is loading, updated from wry's page load callback.
     is_loading: Rc<Cell<bool>>,
-    /// Events that arrived while gpui was busy, emitted on the next render.
-    inbox: Rc<RefCell<Vec<crate::WebviewEvent>>>,
 }
 
 impl Webview {
     /// Creates the webview and starts loading the first page.
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: WebviewOptions) -> Self {
         let is_loading = Rc::new(Cell::new(true));
-        let inbox: Rc<RefCell<Vec<crate::WebviewEvent>>> = Rc::default();
-        let entity = cx.weak_entity();
-        let app = cx.to_async();
+        let mailbox = Mailbox {
+            entity: cx.weak_entity(),
+            app: cx.to_async(),
+        };
 
         let builder = WebViewBuilder::new()
             .with_url(&options.url)
@@ -86,18 +82,8 @@ impl Webview {
             // prefixed lines to wry's IPC channel instead.
             .with_initialization_script(console_bridge_script())
             .with_ipc_handler({
-                let inbox = inbox.clone();
-                move |request| {
-                    let event = crate::WebviewEvent::Message(request.body().clone());
-                    // WebView2 calls back from the message loop, where gpui is
-                    // normally not mid-update; when it is, the event waits for
-                    // the next render.
-                    let mut app = app.clone();
-                    let emitted = entity.update(&mut app, |_, cx| cx.emit(event.clone()));
-                    if emitted.is_err() {
-                        inbox.borrow_mut().push(event);
-                    }
-                }
+                let mailbox = mailbox.clone();
+                move |request| mailbox.emit(WebviewEvent::Message(request.body().clone()))
             })
             .with_on_page_load_handler({
                 let is_loading = is_loading.clone();
@@ -128,7 +114,6 @@ impl Webview {
             last_bounds: None,
             url: options.url,
             is_loading,
-            inbox,
         }
     }
 
@@ -238,6 +223,34 @@ impl Webview {
     }
 }
 
+/// Hands what WebView2 reports over to the gpui entity.
+///
+/// WebView2 calls back from the window's message loop, and gpui may be partway
+/// through an update right then; updating the entity from inside the callback
+/// would trip over gpui's borrow of the app. So delivery goes through gpui's
+/// foreground executor, which runs it once nothing holds the app.
+#[derive(Clone)]
+struct Mailbox {
+    entity: WeakEntity<Webview>,
+    app: AsyncApp,
+}
+
+impl Mailbox {
+    /// Runs `apply` against the webview soon, unless it has gone away by then.
+    fn post(&self, apply: impl FnOnce(&mut Webview, &mut Context<Webview>) + 'static) {
+        let entity = self.entity.clone();
+        self.app
+            .spawn(async move |cx| {
+                let _ = entity.update(cx, apply);
+            })
+            .detach();
+    }
+
+    fn emit(&self, event: WebviewEvent) {
+        self.post(move |_, cx| cx.emit(event));
+    }
+}
+
 /// A script, run before each page's own, that forwards console lines carrying
 /// [`crate::MESSAGE_PREFIX`] to wry's IPC channel.
 fn console_bridge_script() -> String {
@@ -252,7 +265,7 @@ fn console_bridge_script() -> String {
     )
 }
 
-impl gpui::EventEmitter<crate::WebviewEvent> for Webview {}
+impl gpui::EventEmitter<WebviewEvent> for Webview {}
 
 impl gpui::Focusable for Webview {
     fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
@@ -262,9 +275,6 @@ impl gpui::Focusable for Webview {
 
 impl Render for Webview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for event in std::mem::take(&mut *self.inbox.borrow_mut()) {
-            cx.emit(event);
-        }
         div()
             .track_focus(&self.focus_handle)
             .size_full()
