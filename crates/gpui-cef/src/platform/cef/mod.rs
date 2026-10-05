@@ -471,6 +471,7 @@ impl Drop for Webview {
         if let Some(host) = self.host() {
             host.close_browser(1);
         }
+        self.shared.take_browser();
     }
 }
 

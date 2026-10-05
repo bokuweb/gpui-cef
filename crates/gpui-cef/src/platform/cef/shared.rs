@@ -163,6 +163,13 @@ impl Shared {
         *self.browser.borrow_mut() = Some(browser);
     }
 
+    /// Lets go of the browser once the webview is gone. The browser holds the
+    /// client, whose handlers hold this, so keeping it would keep all three
+    /// alive for good.
+    pub(crate) fn take_browser(&self) -> Option<Browser> {
+        self.browser.borrow_mut().take()
+    }
+
     pub(crate) fn host(&self) -> Option<BrowserHost> {
         self.browser
             .borrow()
