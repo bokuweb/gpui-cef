@@ -51,6 +51,9 @@ pub struct WebviewOptions {
     /// When `false`, CEF drives itself at `frame_rate` and hands over BGRA that
     /// is copied on the CPU — roughly 3.9MB per frame at 1200x820.
     pub accelerated: bool,
+    /// What to do when the page asks for a new window. Blocked by default, with
+    /// a [`crate::WebviewEvent::PopupRequested`] for the application.
+    pub popups: PopupPolicy,
 }
 
 impl Default for WebviewOptions {
@@ -60,6 +63,7 @@ impl Default for WebviewOptions {
             transparent: false,
             frame_rate: 60,
             accelerated: false,
+            popups: PopupPolicy::default(),
         }
     }
 }
@@ -72,6 +76,25 @@ impl WebviewOptions {
             ..Default::default()
         }
     }
+}
+
+/// What a webview does when the page asks for a new window: `window.open`, a
+/// `target="_blank"` link (with `rel="noopener"` or without), or a link the
+/// user Cmd-clicks or middle-clicks.
+///
+/// A native popup window is never created. A windowless browser has nowhere
+/// to draw one, and a top-level window the application does not control is
+/// not what an embedding application wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopupPolicy {
+    /// Do not open it, and emit [`crate::WebviewEvent::PopupRequested`] so the
+    /// application can decide what to do instead — hand the URL to the system
+    /// browser with `cx.open_url`, say. `window.open` returns `null` to the
+    /// page.
+    #[default]
+    Block,
+    /// Load the URL in this webview instead, in place of the current page.
+    LoadInPlace,
 }
 
 /// A cookie to put in the browser's store, for [`crate::Runtime::set_cookies`].

@@ -23,10 +23,10 @@ use gpui::{
 };
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
-    PageLoadEvent, Rect, WebView, WebViewBuilder,
+    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
 
-use crate::{Error, RuntimeOptions, WebviewEvent, WebviewOptions};
+use crate::{Error, PopupPolicy, RuntimeOptions, WebviewEvent, WebviewOptions};
 
 /// The WebView2 runtime needs no process-wide setup, so [`Runtime`] holds
 /// nothing. It exists to match the macOS API.
@@ -84,6 +84,25 @@ impl Webview {
             .with_ipc_handler({
                 let mailbox = mailbox.clone();
                 move |request| mailbox.emit(WebviewEvent::Message(request.body().clone()))
+            })
+            // Never let WebView2 open a window of its own; see PopupPolicy.
+            .with_new_window_req_handler({
+                let mailbox = mailbox.clone();
+                let policy = options.popups;
+                move |url, _features| {
+                    match policy {
+                        PopupPolicy::Block => mailbox.emit(WebviewEvent::PopupRequested {
+                            url,
+                            target_frame: String::new(),
+                            user_gesture: false,
+                        }),
+                        PopupPolicy::LoadInPlace if !url.is_empty() => {
+                            mailbox.post(move |this, _| this.load_url(&url))
+                        }
+                        PopupPolicy::LoadInPlace => {}
+                    }
+                    NewWindowResponse::Deny
+                }
             })
             .with_on_page_load_handler({
                 let is_loading = is_loading.clone();

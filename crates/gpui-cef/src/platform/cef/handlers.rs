@@ -12,6 +12,7 @@ use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
 use super::shared::{Frame as SharedFrame, Shared};
+use crate::{PopupPolicy, WebviewEvent, WebviewOptions};
 
 /// Settings carried by `cef::App`.
 #[derive(Clone)]
@@ -340,38 +341,6 @@ fn cursor_style(cursor: CursorType) -> CursorStyle {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn common_cursors_are_mapped() {
-        assert_eq!(cursor_style(CursorType::HAND), CursorStyle::PointingHand);
-        assert_eq!(cursor_style(CursorType::IBEAM), CursorStyle::IBeam);
-        assert_eq!(cursor_style(CursorType::POINTER), CursorStyle::Arrow);
-    }
-
-    #[test]
-    fn unmapped_cursors_fall_back_to_the_arrow() {
-        // No gpui equivalent, and guessing would be worse than an arrow.
-        assert_eq!(cursor_style(CursorType::WAIT), CursorStyle::Arrow);
-        assert_eq!(cursor_style(CursorType::ZOOMIN), CursorStyle::Arrow);
-    }
-
-    #[test]
-    fn opposite_resize_edges_share_a_cursor() {
-        // Left and right edges look the same, as they do everywhere else on macOS.
-        assert_eq!(
-            cursor_style(CursorType::EASTRESIZE),
-            cursor_style(CursorType::WESTRESIZE)
-        );
-        assert_eq!(
-            cursor_style(CursorType::NORTHRESIZE),
-            cursor_style(CursorType::SOUTHRESIZE)
-        );
-    }
-}
-
 /// Picks up load progress and whether history navigation is possible.
 #[derive(Clone)]
 pub(crate) struct LoadState {
@@ -420,11 +389,138 @@ wrap_load_handler! {
     }
 }
 
+/// What the handlers that act on the application's behalf — popups,
+/// navigation, dialogs, downloads — need: somewhere to queue events, and the
+/// policies the application chose.
+#[derive(Clone)]
+pub(crate) struct PageState {
+    pub(crate) shared: Rc<Shared>,
+    pub(crate) options: Rc<WebviewOptions>,
+}
+
+impl PageState {
+    /// A blocked popup becomes an event; one allowed in place becomes a
+    /// navigation of the main frame.
+    fn handle_popup(
+        &self,
+        browser: Option<&mut Browser>,
+        url: String,
+        target_frame: String,
+        user_gesture: bool,
+    ) {
+        match self.options.popups {
+            PopupPolicy::Block => self.shared.push_event(WebviewEvent::PopupRequested {
+                url,
+                target_frame,
+                user_gesture,
+            }),
+            PopupPolicy::LoadInPlace => {
+                // A bare window.open() has nowhere to go.
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(frame) = browser.and_then(|browser| browser.main_frame()) {
+                    frame.load_url(Some(&url.as_str().into()));
+                }
+            }
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    pub(crate) struct GpuiCefLifeSpanHandler {
+        state: PageState,
+    }
+
+    impl LifeSpanHandler {
+        /// `window.open` and `target="_blank"` links. Always cancelled: Alloy
+        /// would otherwise create a native popup window the application has no
+        /// hold on. What happens instead is up to [`PopupPolicy`].
+        fn on_before_popup(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            self.state.handle_popup(
+                browser,
+                string(target_url),
+                string(target_frame_name),
+                user_gesture != 0,
+            );
+            1
+        }
+    }
+}
+
+wrap_request_handler! {
+    pub(crate) struct GpuiCefRequestHandler {
+        state: PageState,
+    }
+
+    impl RequestHandler {
+        /// A link the user asked to open somewhere else — Cmd-click or
+        /// middle-click. Left alone, Chromium would load it here; it goes
+        /// through [`PopupPolicy`] like any other new window instead.
+        fn on_open_urlfrom_tab(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            if !opens_new_window(target_disposition) {
+                return 0;
+            }
+            match self.state.options.popups {
+                // Letting it through loads it in this browser, which is the
+                // policy.
+                PopupPolicy::LoadInPlace => 0,
+                PopupPolicy::Block => {
+                    self.state
+                        .handle_popup(browser, string(target_url), String::new(), user_gesture != 0);
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Whether a navigation was meant for a new tab or window rather than this
+/// one.
+fn opens_new_window(disposition: WindowOpenDisposition) -> bool {
+    !matches!(
+        disposition,
+        WindowOpenDisposition::CURRENT_TAB
+            | WindowOpenDisposition::SAVE_TO_DISK
+            | WindowOpenDisposition::IGNORE_ACTION
+            | WindowOpenDisposition::UNKNOWN
+    )
+}
+
+/// An optional CEF string as an owned one, empty when CEF passed none.
+fn string(value: Option<&CefString>) -> String {
+    value.map(ToString::to_string).unwrap_or_default()
+}
+
 wrap_client! {
     pub(crate) struct GpuiCefClient {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
+        life_span_handler: LifeSpanHandler,
+        request_handler: RequestHandler,
     }
 
     impl Client {
@@ -439,11 +535,23 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
         }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(self.life_span_handler.clone())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
+        }
     }
 }
 
 impl GpuiCefClient {
-    pub(crate) fn build(shared: Rc<Shared>) -> Client {
+    pub(crate) fn build(shared: Rc<Shared>, options: &WebviewOptions) -> Client {
+        let page = PageState {
+            shared: shared.clone(),
+            options: Rc::new(options.clone()),
+        };
         Self::new(
             GpuiCefRenderHandler::new(RenderState {
                 shared: shared.clone(),
@@ -452,6 +560,60 @@ impl GpuiCefClient {
                 shared: shared.clone(),
             }),
             GpuiCefLoadHandler::new(LoadState { shared }),
+            GpuiCefLifeSpanHandler::new(page.clone()),
+            GpuiCefRequestHandler::new(page),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_cursors_are_mapped() {
+        assert_eq!(cursor_style(CursorType::HAND), CursorStyle::PointingHand);
+        assert_eq!(cursor_style(CursorType::IBEAM), CursorStyle::IBeam);
+        assert_eq!(cursor_style(CursorType::POINTER), CursorStyle::Arrow);
+    }
+
+    #[test]
+    fn unmapped_cursors_fall_back_to_the_arrow() {
+        // No gpui equivalent, and guessing would be worse than an arrow.
+        assert_eq!(cursor_style(CursorType::WAIT), CursorStyle::Arrow);
+        assert_eq!(cursor_style(CursorType::ZOOMIN), CursorStyle::Arrow);
+    }
+
+    #[test]
+    fn opposite_resize_edges_share_a_cursor() {
+        // Left and right edges look the same, as they do everywhere else on macOS.
+        assert_eq!(
+            cursor_style(CursorType::EASTRESIZE),
+            cursor_style(CursorType::WESTRESIZE)
+        );
+        assert_eq!(
+            cursor_style(CursorType::NORTHRESIZE),
+            cursor_style(CursorType::SOUTHRESIZE)
+        );
+    }
+
+    #[test]
+    fn only_new_tabs_and_windows_count_as_popups() {
+        for disposition in [
+            WindowOpenDisposition::NEW_FOREGROUND_TAB,
+            WindowOpenDisposition::NEW_BACKGROUND_TAB,
+            WindowOpenDisposition::NEW_POPUP,
+            WindowOpenDisposition::NEW_WINDOW,
+        ] {
+            assert!(opens_new_window(disposition), "{disposition:?}");
+        }
+        // Loading here, saving a link, and nothing at all are not windows.
+        for disposition in [
+            WindowOpenDisposition::CURRENT_TAB,
+            WindowOpenDisposition::SAVE_TO_DISK,
+            WindowOpenDisposition::IGNORE_ACTION,
+        ] {
+            assert!(!opens_new_window(disposition), "{disposition:?}");
+        }
     }
 }

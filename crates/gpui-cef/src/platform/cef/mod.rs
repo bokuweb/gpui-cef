@@ -281,7 +281,7 @@ impl Webview {
             ..Default::default()
         };
 
-        let mut client = handlers::GpuiCefClient::build(shared.clone());
+        let mut client = handlers::GpuiCefClient::build(shared.clone(), &options);
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),

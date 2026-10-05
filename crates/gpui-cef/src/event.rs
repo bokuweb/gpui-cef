@@ -17,4 +17,22 @@ pub enum WebviewEvent {
     /// Untrusted: any script running in the page can post one, so treat it as
     /// input from the page, not from the application.
     Message(String),
+
+    /// The page asked for a new window and [`PopupPolicy::Block`] kept it
+    /// from opening.
+    ///
+    /// [`PopupPolicy::Block`]: crate::PopupPolicy::Block
+    #[non_exhaustive]
+    PopupRequested {
+        /// Where the new window would have gone. Empty for a bare
+        /// `window.open()`.
+        url: String,
+        /// The window name the page gave, as in `window.open(url, "name")` or
+        /// `target="name"`. Empty for `_blank` or no name, and always empty
+        /// with WebView2.
+        target_frame: String,
+        /// Whether the user asked for it — clicked a link, say — rather than
+        /// the page opening it on its own. Always `false` with WebView2.
+        user_gesture: bool,
+    },
 }
