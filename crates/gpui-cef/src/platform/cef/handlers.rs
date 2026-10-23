@@ -929,6 +929,34 @@ fn string(value: Option<&CefString>) -> String {
     value.map(ToString::to_string).unwrap_or_default()
 }
 
+wrap_keyboard_handler! {
+    pub(crate) struct GpuiCefKeyboardHandler {}
+
+    impl KeyboardHandler {
+        fn on_key_event(
+            &self,
+            browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: *mut u8,
+        ) -> i32 {
+            use super::input::{clipboard_command, ClipboardCommand};
+
+            let Some(command) = event.and_then(clipboard_command) else {
+                return 0;
+            };
+            let Some(frame) = browser.and_then(|browser| browser.focused_frame()) else {
+                return 0;
+            };
+            match command {
+                ClipboardCommand::Copy => frame.copy(),
+                ClipboardCommand::Cut => frame.cut(),
+                ClipboardCommand::Paste => frame.paste(),
+            }
+            1
+        }
+    }
+}
+
 /// The handlers that act on the application's behalf, built from one
 /// [`PageState`].
 #[derive(Clone)]
@@ -971,6 +999,10 @@ wrap_client! {
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
+        }
+
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(GpuiCefKeyboardHandler::new())
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {

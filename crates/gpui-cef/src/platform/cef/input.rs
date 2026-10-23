@@ -16,6 +16,32 @@ const EVENTFLAG_MIDDLE_MOUSE_BUTTON: u32 = 1 << 5;
 const EVENTFLAG_RIGHT_MOUSE_BUTTON: u32 = 1 << 6;
 const EVENTFLAG_COMMAND_DOWN: u32 = 1 << 7;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardCommand {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// macOS windowless browsers have no native view to receive AppKit's editing
+/// selectors. Call this only for keys left unhandled by the renderer, so a
+/// page's own clipboard shortcuts keep precedence.
+pub(crate) fn clipboard_command(event: &KeyEvent) -> Option<ClipboardCommand> {
+    let keyboard_modifiers =
+        EVENTFLAG_COMMAND_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN;
+    if event.type_ != KeyEventType::RAWKEYDOWN
+        || event.modifiers & keyboard_modifiers != EVENTFLAG_COMMAND_DOWN
+    {
+        return None;
+    }
+    match event.windows_key_code {
+        0x43 => Some(ClipboardCommand::Copy),
+        0x58 => Some(ClipboardCommand::Cut),
+        0x56 => Some(ClipboardCommand::Paste),
+        _ => None,
+    }
+}
+
 /// gpui modifier state to CEF's `modifiers` bits.
 pub(crate) fn modifiers(modifiers: &Modifiers) -> u32 {
     let mut flags = 0;
@@ -552,5 +578,43 @@ mod tests {
         assert_eq!(windows_key_code("unknownkey"), 0);
         // Multi-byte input must not panic on a byte-wise slice.
         assert_eq!(windows_key_code("あ"), 0);
+    }
+
+    #[test]
+    fn native_clipboard_shortcuts_require_an_unhandled_command_key_down() {
+        for (key, command) in [
+            ("c", ClipboardCommand::Copy),
+            ("x", ClipboardCommand::Cut),
+            ("v", ClipboardCommand::Paste),
+        ] {
+            for bits in 0..16 {
+                let mut event = new_key_event(KeyEventType::RAWKEYDOWN, EVENTFLAG_COMMAND_DOWN);
+                event.windows_key_code = windows_key_code(key);
+                if bits & 1 != 0 {
+                    event.modifiers |= EVENTFLAG_SHIFT_DOWN;
+                }
+                if bits & 2 != 0 {
+                    event.modifiers |= EVENTFLAG_CONTROL_DOWN;
+                }
+                if bits & 4 != 0 {
+                    event.modifiers |= EVENTFLAG_ALT_DOWN;
+                }
+                if bits & 8 != 0 {
+                    event.modifiers &= !EVENTFLAG_COMMAND_DOWN;
+                }
+                assert_eq!(
+                    clipboard_command(&event),
+                    if bits == 0 { Some(command) } else { None }
+                );
+            }
+        }
+        for type_ in [KeyEventType::KEYUP, KeyEventType::CHAR] {
+            let mut event = new_key_event(type_, EVENTFLAG_COMMAND_DOWN);
+            event.windows_key_code = windows_key_code("v");
+            assert_eq!(clipboard_command(&event), None);
+        }
+        let mut event = new_key_event(KeyEventType::RAWKEYDOWN, EVENTFLAG_COMMAND_DOWN);
+        event.windows_key_code = windows_key_code("z");
+        assert_eq!(clipboard_command(&event), None);
     }
 }
