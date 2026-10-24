@@ -289,6 +289,21 @@ through the page over the remote debugging port with a small CDP client
 ends: the event the demo logged, and what the page or the disk saw after the
 answer. It opens a real window, so it is not part of CI.
 
+```bash
+just input-e2e
+```
+
+checks the actual AppKit `NSTextInputClient` → GPUI → CEF path on macOS,
+including accented characters, surrogate pairs, composition updates, commit,
+finish and cancellation. The Node wrapper copies the bundle into a temporary
+directory, changes its identifier, marks it background-only, signs it and
+removes it afterwards. The test uses a disposable CEF profile, no debugging
+port, a hidden window and logical browser focus without activating the app.
+It invokes the native text-client callbacks and asserts the renderer's DOM
+values and UTF-16 marked ranges. It does not send keyboard events, switch the
+system input source or verify real IME candidate UI, physical input latency or
+audio. A macOS WindowServer/Metal session is still required.
+
 Anything that needs a live browser is exercised by running the demo instead.
 CEF's remote debugging port is open, so `http://127.0.0.1:9229/json/list` plus
 CDP can drive and inspect the page without looking at the screen — useful both in
