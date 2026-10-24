@@ -111,8 +111,7 @@ pub(crate) fn key_down_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     let mut event = new_key_event(KeyEventType::RAWKEYDOWN, modifiers(&keystroke.modifiers));
     event.windows_key_code = vk;
     event.native_key_code = native_key_code(&keystroke.key, vk);
-    event.character = first_utf16(keystroke.key_char.as_deref().unwrap_or_default());
-    event.unmodified_character = first_utf16(&keystroke.key);
+    (event.character, event.unmodified_character) = key_characters(keystroke);
     event
 }
 
@@ -161,9 +160,48 @@ pub(crate) fn key_up_event(keystroke: &gpui::Keystroke) -> KeyEvent {
     let mut event = new_key_event(KeyEventType::KEYUP, modifiers(&keystroke.modifiers));
     event.windows_key_code = vk;
     event.native_key_code = native_key_code(&keystroke.key, vk);
-    event.character = first_utf16(keystroke.key_char.as_deref().unwrap_or_default());
-    event.unmodified_character = first_utf16(&keystroke.key);
+    (event.character, event.unmodified_character) = key_characters(keystroke);
     event
+}
+
+fn key_characters(keystroke: &gpui::Keystroke) -> (u16, u16) {
+    // CEF on macOS reconstructs an NSEvent from these fields before deriving
+    // its WebKeyboardEvent. A GPUI name such as "backspace" is not an AppKit
+    // character: passing its first letter prevents native editing commands.
+    #[cfg(target_os = "macos")]
+    {
+        let named = match keystroke.key.as_str() {
+            "backspace" => Some(0x7f),
+            "delete" => Some(0xf728),
+            "up" => Some(0xf700),
+            "down" => Some(0xf701),
+            "left" => Some(0xf702),
+            "right" => Some(0xf703),
+            "home" => Some(0xf729),
+            "end" => Some(0xf72b),
+            "pageup" => Some(0xf72c),
+            "pagedown" => Some(0xf72d),
+            "insert" => Some(0xf727),
+            "enter" => Some(0x0d),
+            "tab" => Some(0x09),
+            "escape" => Some(0x1b),
+            "space" => Some(0x20),
+            key => key.strip_prefix('f').and_then(|number| {
+                number
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| (1..=20).contains(n))
+                    .map(|n| 0xf703 + n)
+            }),
+        };
+        if let Some(character) = named {
+            return (character, character);
+        }
+    }
+    (
+        first_utf16(keystroke.key_char.as_deref().unwrap_or_default()),
+        first_utf16(&keystroke.key),
+    )
 }
 
 fn first_utf16(text: &str) -> u16 {
@@ -389,6 +427,49 @@ mod tests {
         assert_eq!(event.windows_key_code, 'A' as i32);
         assert_eq!(event.character, 'a' as u16);
         assert_eq!(event.unmodified_character, 'a' as u16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_named_keys_preserve_appkit_characters_in_both_key_events() {
+        for (key, character) in [
+            ("backspace", 0x7f),
+            ("delete", 0xf728),
+            ("left", 0xf702),
+            ("right", 0xf703),
+            ("up", 0xf700),
+            ("down", 0xf701),
+            ("home", 0xf729),
+            ("end", 0xf72b),
+            ("pageup", 0xf72c),
+            ("pagedown", 0xf72d),
+            ("enter", 0x0d),
+            ("tab", 0x09),
+            ("escape", 0x1b),
+            ("space", 0x20),
+            ("insert", 0xf727),
+            ("f1", 0xf704),
+            ("f20", 0xf717),
+        ] {
+            let key = keystroke(key, None, Modifiers::default());
+            for event in [key_down_event(&key), key_up_event(&key)] {
+                assert_eq!(event.character, character, "{} character", key.key);
+                assert_eq!(
+                    event.unmodified_character, character,
+                    "{} unmodified",
+                    key.key
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_return_uses_cr_even_when_gpui_reports_lf() {
+        let key = keystroke("enter", Some("\n"), Modifiers::default());
+        for event in [key_down_event(&key), key_up_event(&key)] {
+            assert_eq!((event.character, event.unmodified_character), (0x0d, 0x0d));
+        }
     }
 
     #[test]

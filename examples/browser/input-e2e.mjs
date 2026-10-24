@@ -41,7 +41,10 @@ try {
   assert.deepEqual(result.values, [
     "Aé😀", "Aé😀に", "Aé😀日本😀", "Aé😀日本😀", "Aé😀日本😀!",
     "Aé😀日本😀!語", "Aé😀日本😀!語", "Aé😀日本😀!語消", "Aé😀日本😀!語",
+    "Aé😀日本😀!", "Aé😀日本😀!", "Aé😀日本😀?!", "Aé😀日本😀?",
+    "Aé😀日本😀", "Aé😀日本", "Aé😀日本😀", "Aé😀日本😀a", "Aé😀日本😀",
   ]);
+  assert.equal(result.syntheticNativeKeyEventPairs, 7);
   assert.equal(result.realKeyboardImeOrAudioVerified, false);
   console.log(JSON.stringify(result, null, 2));
 } finally {

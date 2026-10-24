@@ -300,8 +300,11 @@ directory, changes its identifier, marks it background-only, signs it and
 removes it afterwards. The test uses a disposable CEF profile, no debugging
 port, a hidden window and logical browser focus without activating the app.
 It invokes the native text-client callbacks and asserts the renderer's DOM
-values and UTF-16 marked ranges. It does not send keyboard events, switch the
-system input source or verify real IME candidate UI, physical input latency or
+values and UTF-16 marked ranges. It also sends synthetic typing, Backspace, Left and
+Delete NSEvents directly to its own view and checks typing, caret movement and
+deletion of complete surrogate pairs.
+It does not post system keyboard events, switch the system input source or
+verify real IME candidate UI, physical input latency or
 audio. A macOS WindowServer/Metal session is still required.
 
 Anything that needs a live browser is exercised by running the demo instead.
