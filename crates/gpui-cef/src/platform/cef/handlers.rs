@@ -957,6 +957,50 @@ wrap_keyboard_handler! {
     }
 }
 
+// Return None for unrelated permissions so their existing CEF behavior remains
+// unchanged. Never approve a combined request: ACCEPT applies to every bit.
+fn clipboard_permission_result(
+    options: &WebviewOptions,
+    origin: &str,
+    permissions: u32,
+) -> Option<PermissionRequestResult> {
+    let clipboard = PermissionRequestTypes::CLIPBOARD.get_raw();
+    if permissions & clipboard == 0 {
+        return None;
+    }
+    let allowed = permissions == clipboard
+        && crate::options::clipboard_access_allowed(options.clipboard_access.as_ref(), origin);
+    Some(if allowed {
+        PermissionRequestResult::ACCEPT
+    } else {
+        PermissionRequestResult::DENY
+    })
+}
+
+wrap_permission_handler! {
+    pub(crate) struct GpuiCefPermissionHandler {
+        state: PageState,
+    }
+
+    impl PermissionHandler {
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else { return 0; };
+            let Some(result) = clipboard_permission_result(
+                &self.state.options, &string(requesting_origin), requested_permissions,
+            ) else { return 0; };
+            callback.cont(result);
+            1
+        }
+    }
+}
+
 /// The handlers that act on the application's behalf, built from one
 /// [`PageState`].
 #[derive(Clone)]
@@ -966,6 +1010,7 @@ pub(crate) struct PageHandlers {
     js_dialog: JsdialogHandler,
     dialog: DialogHandler,
     download: DownloadHandler,
+    permission: PermissionHandler,
 }
 
 impl PageHandlers {
@@ -975,6 +1020,7 @@ impl PageHandlers {
             request: GpuiCefRequestHandler::new(page.clone()),
             js_dialog: GpuiCefJsDialogHandler::new(page.clone()),
             dialog: GpuiCefDialogHandler::new(page.clone()),
+            permission: GpuiCefPermissionHandler::new(page.clone()),
             download: GpuiCefDownloadHandler::new(page),
         }
     }
@@ -1021,6 +1067,10 @@ wrap_client! {
             Some(self.page.dialog.clone())
         }
 
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.page.permission.clone())
+        }
+
         fn download_handler(&self) -> Option<DownloadHandler> {
             Some(self.page.download.clone())
         }
@@ -1049,6 +1099,84 @@ impl GpuiCefClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_permissions_deny_by_default_and_only_accept_the_approved_origin() {
+        let mut options = WebviewOptions::default();
+        let clipboard = PermissionRequestTypes::CLIPBOARD.get_raw();
+        assert_eq!(
+            clipboard_permission_result(&options, "https://editor.example", clipboard),
+            Some(PermissionRequestResult::DENY)
+        );
+        options.clipboard_access = Some(std::sync::Arc::new(|origin| {
+            origin == "https://editor.example"
+        }));
+        assert_eq!(
+            clipboard_permission_result(&options, "https://editor.example", clipboard),
+            Some(PermissionRequestResult::ACCEPT)
+        );
+        for origin in ["", "null", "https://other.example"] {
+            assert_eq!(
+                clipboard_permission_result(&options, origin, clipboard),
+                Some(PermissionRequestResult::DENY)
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_does_not_grant_other_permission_bits_or_call_the_filter_for_them() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let options = WebviewOptions {
+            clipboard_access: Some(std::sync::Arc::new(move |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            })),
+            ..Default::default()
+        };
+        let clipboard = PermissionRequestTypes::CLIPBOARD.get_raw();
+        assert_eq!(
+            clipboard_permission_result(&options, "https://editor.example", 0),
+            None
+        );
+        for bit in 0..32 {
+            let other = 1u32 << bit;
+            if other == clipboard {
+                continue;
+            }
+            assert_eq!(
+                clipboard_permission_result(&options, "https://editor.example", other),
+                None
+            );
+            assert_eq!(
+                clipboard_permission_result(&options, "https://editor.example", clipboard | other),
+                Some(PermissionRequestResult::DENY)
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn clients_install_the_permission_handler_even_for_default_denials() {
+        let client = GpuiCefClient::build(
+            Shared::new("about:blank".into()),
+            &WebviewOptions::default(),
+        );
+        let handler = client
+            .permission_handler()
+            .expect("clipboard requests must get an answer");
+        // Without a CEF callback, the request cannot be completed here.
+        assert_eq!(
+            handler.on_show_permission_prompt(
+                None,
+                1,
+                None,
+                PermissionRequestTypes::CLIPBOARD.get_raw(),
+                None
+            ),
+            0
+        );
+    }
 
     #[test]
     fn common_cursors_are_mapped() {
