@@ -34,19 +34,23 @@ impl Webview {
             "commit_now text={text:?} was_composing={was_composing} pending_key={pending_key:?}"
         ));
         if let Some(host) = self.host() {
-            if was_composing {
+            if !was_composing {
+                if let Some(keystroke) = pending_key {
+                    host.send_key_event(Some(&super::input::key_down_event(keystroke)));
+                }
+            }
+            if was_composing || text.chars().any(|character| character.len_utf16() > 1) {
                 // The ranges AppKit gives gpui refer to our small composition
                 // mirror, not to the page's document. CEF already owns the real
                 // selection, so an absent replacement range commits at its caret.
                 let replacement_range = invalid_cef_range();
                 host.ime_commit_text(Some(&text.into()), Some(&replacement_range), 0);
             } else {
-                // ImeCommitText completes an existing composition; it is not
-                // Chromium's general text insertion API. Plain text therefore
-                // travels as CHAR events after AppKit accepts it.
-                if let Some(keystroke) = pending_key {
-                    host.send_key_event(Some(&super::input::key_down_event(keystroke)));
-                }
+                // Preserve the normal keyboard path for BMP text. A CEF CHAR
+                // holds only one UTF-16 unit: splitting an astral scalar into
+                // two CHARs emits ill-formed DOM input events and can corrupt
+                // editors that encode each event separately. Commit that text
+                // atomically above, even without an existing composition.
                 for event in super::input::text_events(text) {
                     host.send_key_event(Some(&event));
                 }

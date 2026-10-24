@@ -73,6 +73,10 @@ pub fn run(report: PathBuf) {
         r#"<!doctype html><meta charset=utf-8><input id=e autofocus><script>
         window.keyEvents=[]; for(const t of ['keydown','keyup','beforeinput','input'])
         document.addEventListener(t,e=>keyEvents.push([t,e.key,e.code,e.inputType]));
+        window.inputEvents=[]; for(const t of ['beforeinput','input'])
+        document.addEventListener(t,e=>{if(typeof e.data==='string') inputEvents.push({
+          type:t,wellFormed:e.data.isWellFormed(),
+          units:Array.from({length:e.data.length},(_,i)=>e.data.charCodeAt(i))});});
         </script>"#,
     )
     .unwrap();
@@ -178,7 +182,7 @@ pub fn run(report: PathBuf) {
             assert_hidden(app, view);
             let key_events = window_key_events(&webview, &replies, cx).await;
             assert_eq!(
-                key_events,
+                key_events["keys"],
                 serde_json::json!([
                     ["keydown", "a"],
                     ["keyup", "a"],
@@ -192,13 +196,23 @@ pub fn run(report: PathBuf) {
                     ["keyup", "Backspace"],
                 ])
             );
+            assert!(
+                key_events["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|event| event["wellFormed"].as_bool() == Some(true)),
+                "individual input events must preserve Unicode scalars: {}",
+                key_events["input"]
+            );
             std::fs::write(
                 &report,
                 serde_json::to_vec_pretty(&serde_json::json!({
                     "values": values, "visible": false, "activationPolicy": 2,
                     "syntheticNativeKeyEventPairs": 7,
                     "syntheticWindowKeyEventPairs": 5,
-                    "windowKeyEvents": key_events,
+                    "windowKeyEvents": key_events["keys"],
+                    "inputEventsWellFormed": true,
                     "unhandledSelectorObserverVerified": true,
                     "unhandledSelectorCount": UNHANDLED_SELECTORS.load(Ordering::SeqCst),
                     "realKeyboardImeOrAudioVerified": false,
@@ -340,7 +354,7 @@ async fn window_key_events(
     cx: &mut gpui::AsyncApp,
 ) -> serde_json::Value {
     let script = gpui_cef::post_message_script(
-        "'window-keys:' + JSON.stringify(keyEvents.filter(e=>e[0]==='keydown'||e[0]==='keyup').slice(-10).map(e=>e.slice(0,2)))",
+        "'window-keys:' + JSON.stringify({keys:keyEvents.filter(e=>e[0]==='keydown'||e[0]==='keyup').slice(-10).map(e=>e.slice(0,2)),input:inputEvents})",
     );
     webview.update(cx, |webview, _| webview.eval(&script));
     let deadline = Instant::now() + Duration::from_secs(5);

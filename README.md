@@ -259,10 +259,13 @@ trait is written for an editor that owns its text, which this does not — but t
 OS only ever asks about the text it is currently composing, and a mirror of just
 that much is enough.
 
-One consequence: `RAWKEYDOWN` is the only key event sent to CEF. The text a key
-produces arrives through the input handler instead, because that is the only path
-that also works for composition. Sending CEF's `CHAR` event as well would insert
-every character twice.
+Text is sent only after the platform input handler accepts it. Ordinary BMP text
+uses CEF `CHAR` events; composition commits and text containing astral Unicode
+characters use `ImeCommitText`. A `CHAR` holds only one UTF-16 unit, so sending a
+surrogate pair as two such events exposes ill-formed `beforeinput` / `input` data
+to editors even when a plain input's eventual value looks correct. Astral text
+is committed atomically, including when there is no active composition. The
+native input probe checks each DOM input event as well as the final value.
 
 ## Testing
 
