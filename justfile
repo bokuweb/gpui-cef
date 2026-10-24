@@ -48,6 +48,10 @@ run: bundle
 e2e: bundle
     node examples/browser/e2e.mjs
 
+# Real AppKit text-client callbacks in an isolated, invisible macOS bundle.
+input-e2e: bundle
+    node examples/browser/input-e2e.mjs
+
 fmt:
     cargo fmt --all
 

@@ -19,6 +19,8 @@
 //! "Feature test page" bookmark has a button for each.
 
 mod demo;
+#[cfg(target_os = "macos")]
+mod input_probe;
 
 use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
@@ -1058,6 +1060,11 @@ fn urlencode(input: &str) -> String {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(report) = std::env::var_os("GPUI_CEF_INPUT_PROBE_REPORT") {
+        input_probe::run(report.into());
+        return;
+    }
     env_logger::init();
 
     // 1. At the top of main: load CEF into the process. The real initialization
