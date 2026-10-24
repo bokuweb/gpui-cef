@@ -61,6 +61,13 @@ pub struct WebviewOptions {
     /// dialogs. By default each one becomes a [`crate::WebviewEvent::JsDialog`]
     /// for the application to answer. macOS (CEF) only: WebView2 shows its own.
     pub js_dialogs: DialogPolicy,
+    /// Decide whether an origin may use the asynchronous Clipboard API.
+    /// Denied by default. macOS (CEF) only.
+    ///
+    /// Approving an origin allows reading its system clipboard; only approve
+    /// trusted application content. Chromium may remember the decision for
+    /// the lifetime of the browser context. Native Cmd+C/X/V do not need this.
+    pub clipboard_access: Option<ClipboardAccessFilter>,
 }
 
 impl Default for WebviewOptions {
@@ -73,6 +80,7 @@ impl Default for WebviewOptions {
             popups: PopupPolicy::default(),
             navigation_filter: None,
             js_dialogs: DialogPolicy::default(),
+            clipboard_access: None,
         }
     }
 }
@@ -93,6 +101,10 @@ impl std::fmt::Debug for WebviewOptions {
                     .map(|_| "Fn(&NavigationRequest) -> bool"),
             )
             .field("js_dialogs", &self.js_dialogs)
+            .field(
+                "clipboard_access",
+                &self.clipboard_access.as_ref().map(|_| "Fn(&str) -> bool"),
+            )
             .finish()
     }
 }
@@ -158,6 +170,25 @@ pub enum DialogPolicy {
 /// the browser engine — so keep it quick, and do not reach back into the
 /// webview from it. A filter that panics counts as a refusal.
 pub type NavigationFilter = std::sync::Arc<dyn Fn(&NavigationRequest) -> bool + Send + Sync>;
+
+/// Called synchronously with the requesting origin for a Clipboard API
+/// permission request. Return true only for trusted origins. Keep it quick
+/// and do not call back into the webview. A panic is treated as a refusal.
+pub type ClipboardAccessFilter = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn clipboard_access_allowed(
+    filter: Option<&ClipboardAccessFilter>,
+    origin: &str,
+) -> bool {
+    let Some(filter) = filter.filter(|_| !origin.is_empty()) else {
+        return false;
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter(origin))).unwrap_or_else(|_| {
+        log::error!("the clipboard access filter panicked; denying access");
+        false
+    })
+}
 
 /// A navigation about to happen, as a [`NavigationFilter`] sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,10 +324,45 @@ mod tests {
     fn options_print_without_their_closures() {
         let options = WebviewOptions {
             navigation_filter: Some(std::sync::Arc::new(|_| true)),
+            clipboard_access: Some(std::sync::Arc::new(|_| true)),
             ..WebviewOptions::url("https://example.com/")
         };
         let printed = format!("{options:?}");
         assert!(printed.contains("https://example.com/"));
         assert!(printed.contains("navigation_filter: Some"));
+        assert!(printed.contains("clipboard_access: Some"));
+    }
+
+    #[test]
+    fn clipboard_requires_an_explicit_origin_decision() {
+        let options = WebviewOptions::default();
+        assert!(!clipboard_access_allowed(
+            options.clipboard_access.as_ref(),
+            "https://editor.example"
+        ));
+        let filter: ClipboardAccessFilter =
+            std::sync::Arc::new(|origin| origin == "https://editor.example");
+        assert!(clipboard_access_allowed(
+            Some(&filter),
+            "https://editor.example"
+        ));
+        for origin in [
+            "",
+            "null",
+            "http://editor.example",
+            "https://editor.example.evil",
+            "https://editor.example:444",
+        ] {
+            assert!(!clipboard_access_allowed(Some(&filter), origin));
+        }
+    }
+
+    #[test]
+    fn a_panicking_clipboard_filter_refuses_access() {
+        let filter: ClipboardAccessFilter = std::sync::Arc::new(|_| panic!("filter bug"));
+        assert!(!clipboard_access_allowed(
+            Some(&filter),
+            "https://editor.example"
+        ));
     }
 }

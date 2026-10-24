@@ -44,7 +44,7 @@
 //! [`WebviewEvent`] — subscribe with `cx.subscribe(&webview, ...)` — and is
 //! answered through the [`Webview`]: [`Webview::resolve_dialog`],
 //! [`Webview::resolve_file_dialog`], [`Webview::resolve_download`].
-//! [`WebviewOptions`] holds the policies for popups, navigation and dialogs.
+//! [`WebviewOptions`] holds the policies for popups, navigation, dialogs and clipboard access.
 
 // The usage example above is deliberately a full `fn main`, since the ordering
 // around it is the whole point.
@@ -59,8 +59,8 @@ pub use event::{
     TerminationStatus, WebviewEvent,
 };
 pub use options::{
-    CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PdfMargins, PdfOptions,
-    PopupPolicy, RuntimeOptions, SameSite, WebviewOptions,
+    ClipboardAccessFilter, CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest,
+    PdfMargins, PdfOptions, PopupPolicy, RuntimeOptions, SameSite, WebviewOptions,
 };
 pub use platform::{init, Runtime, Webview};
 
