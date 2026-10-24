@@ -31,30 +31,31 @@ pub(crate) enum Frame {
 
 /// One layer's worth of frame bookkeeping. CEF paints the page and any popup
 /// (a `<select>` dropdown, say) as separate layers, and each needs the same
-/// "latest frame plus the texture gpui should now release" handling.
+/// "latest frame plus the textures gpui should now release" handling.
 #[derive(Default)]
 struct FrameSlot {
     frame: RefCell<Option<Frame>>,
-    stale_cpu: RefCell<Option<Arc<RenderImage>>>,
+    stale_cpu: RefCell<Vec<Arc<RenderImage>>>,
 }
 
 impl FrameSlot {
     fn put(&self, frame: Frame) {
         // If the outgoing frame was a CPU one, it has to be dropped from gpui's
-        // texture cache, so remember it.
+        // texture cache. More paints may arrive before the pump drains this
+        // slot, so retain every outgoing image until then.
         if let Some(Frame::Cpu(old)) = self.frame.replace(Some(frame)) {
-            *self.stale_cpu.borrow_mut() = Some(old);
+            self.stale_cpu.borrow_mut().push(old);
         }
     }
 
     fn clear(&self) {
         if let Some(Frame::Cpu(old)) = self.frame.replace(None) {
-            *self.stale_cpu.borrow_mut() = Some(old);
+            self.stale_cpu.borrow_mut().push(old);
         }
     }
 
-    fn take_stale(&self) -> Option<Arc<RenderImage>> {
-        self.stale_cpu.borrow_mut().take()
+    fn take_stale(&self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut *self.stale_cpu.borrow_mut())
     }
 }
 
@@ -431,10 +432,9 @@ impl Shared {
 
     /// Takes the stale frames that gpui should release from its texture cache.
     pub(crate) fn take_stale_cpu_frames(&self) -> Vec<Arc<RenderImage>> {
-        [self.view.take_stale(), self.popup.take_stale()]
-            .into_iter()
-            .flatten()
-            .collect()
+        let mut stale = self.view.take_stale();
+        stale.extend(self.popup.take_stale());
+        stale
     }
 
     pub(crate) fn take_dirty(&self) -> bool {
@@ -531,6 +531,8 @@ impl Shared {
 mod tests {
     use super::*;
     use gpui::{point, Bounds};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds {
@@ -699,6 +701,108 @@ mod tests {
         assert_eq!(stale.len(), 1);
         assert!(Arc::ptr_eq(&stale[0], &first));
         assert!(shared.take_stale_cpu_frames().is_empty());
+    }
+
+    #[test]
+    fn a_burst_of_paints_preserves_every_texture_eviction() {
+        let shared = Shared::new("about:blank".into());
+        let first = cpu_frame(2, 2);
+        let second = cpu_frame(2, 2);
+        shared.put_frame(Frame::Cpu(first.clone()));
+        // gpui can cache the first image before the next message-pump tick.
+        shared.with_frame(|frame| assert!(matches!(frame, Some(Frame::Cpu(_)))));
+        shared.put_frame(Frame::Cpu(second.clone()));
+        shared.put_frame(Frame::Cpu(cpu_frame(2, 2)));
+
+        let stale = shared.take_stale_cpu_frames();
+        assert_eq!(stale.len(), 2);
+        assert!(Arc::ptr_eq(&stale[0], &first));
+        assert!(Arc::ptr_eq(&stale[1], &second));
+        assert!(shared.take_stale_cpu_frames().is_empty());
+    }
+
+    #[derive(Clone, Debug)]
+    enum FrameCommand {
+        PaintView,
+        PaintPopup,
+        ShowPopup(bool),
+        Drain,
+    }
+
+    fn frame_command() -> impl Strategy<Value = FrameCommand> {
+        prop_oneof![
+            3 => Just(FrameCommand::PaintView),
+            3 => Just(FrameCommand::PaintPopup),
+            2 => any::<bool>().prop_map(FrameCommand::ShowPopup),
+            2 => Just(FrameCommand::Drain),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn mixed_frame_updates_release_each_retired_image_once(
+            commands in prop::collection::vec(frame_command(), 0..129)
+        ) {
+            let shared = Shared::new("about:blank".into());
+            // The model uses creation indices and a set of released indices;
+            // it does not mirror the implementation's pending-frame storage.
+            let mut images: Vec<Arc<RenderImage>> = Vec::new();
+            let mut current_view = None;
+            let mut current_popup = None;
+            let mut popup_visible = false;
+            let mut released = BTreeSet::new();
+
+            for (step, command) in commands.into_iter().chain([FrameCommand::Drain]).enumerate() {
+                match command {
+                    FrameCommand::PaintView | FrameCommand::PaintPopup => {
+                        let index = images.len();
+                        let image = cpu_frame(1, 1);
+                        images.push(image.clone());
+                        if matches!(command, FrameCommand::PaintView) {
+                            current_view = Some(index);
+                            shared.put_frame(Frame::Cpu(image));
+                        } else {
+                            current_popup = Some(index);
+                            shared.put_popup_frame(Frame::Cpu(image));
+                        }
+                    }
+                    FrameCommand::ShowPopup(visible) => {
+                        popup_visible = visible;
+                        if !visible {
+                            current_popup = None;
+                        }
+                        shared.set_popup_visible(visible);
+                    }
+                    FrameCommand::Drain => {
+                        // Every created image which is no longer current must
+                        // be evicted exactly once, regardless of layer/order.
+                        let expected: Vec<_> = (0..images.len())
+                            .filter(|index| Some(*index) != current_view
+                                && Some(*index) != current_popup
+                                && !released.contains(index))
+                            .collect();
+                        let mut actual: Vec<_> = shared.take_stale_cpu_frames().iter()
+                            .map(|image| images.iter().position(|known| Arc::ptr_eq(known, image)))
+                            .collect();
+                        actual.sort_unstable();
+                        prop_assert_eq!(actual, expected.iter().copied().map(Some).collect::<Vec<_>>(),
+                            "drain at step {}", step);
+                        released.extend(expected);
+                    }
+                }
+                let identify = |frame: Option<&Frame>| match frame {
+                    Some(Frame::Cpu(image)) => images.iter().position(|known| Arc::ptr_eq(known, image)),
+                    _ => None,
+                };
+                prop_assert_eq!(shared.with_frame(identify), current_view,
+                    "view at step {} after {:?}", step, command);
+                let visible_popup = if popup_visible { current_popup } else { None };
+                prop_assert_eq!(shared.with_popup(|popup| identify(popup.map(|(frame, _)| frame))), visible_popup,
+                    "popup at step {} after {:?}", step, command);
+            }
+        }
     }
 
     #[test]
