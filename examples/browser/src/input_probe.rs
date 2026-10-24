@@ -13,6 +13,7 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -21,7 +22,10 @@ enum Input {
     Mark(&'static str),
     Finish,
     Key(&'static str, u16),
+    WindowKey(&'static str, u16),
 }
+
+static UNHANDLED_SELECTORS: AtomicUsize = AtomicUsize::new(0);
 
 // GPUI registers its legacy NSRange spelling, while objc2-foundation uses
 // _NSRange. Match the actual client's encoding as well as its C layout.
@@ -61,6 +65,7 @@ pub fn run(report: PathBuf) {
     let allowed: Bool = unsafe { msg_send![&*background, boolValue] };
     assert!(allowed.as_bool());
     prohibit_activation();
+    observe_unhandled_selectors();
 
     let page = report.with_file_name("input.html");
     std::fs::write(
@@ -119,6 +124,11 @@ pub fn run(report: PathBuf) {
                 raw.ns_view.as_ptr() as *mut AnyObject
             })
             .unwrap();
+        unsafe {
+            // Verify the observer before using its zero count as evidence.
+            let _: () = msg_send![view, noResponderFor: sel!(gpuiCefProbeUnhandledSelector)];
+        }
+        assert_eq!(UNHANDLED_SELECTORS.swap(0, Ordering::SeqCst), 1);
         let replies = Rc::new(RefCell::new(Vec::<String>::new()));
         let received = replies.clone();
         cx.subscribe(&webview, move |_, event: &WebviewEvent, _| {
@@ -147,6 +157,12 @@ pub fn run(report: PathBuf) {
                 (Input::Insert("😀"), "Aé😀日本😀", 0),
                 (Input::Key("a", 0), "Aé😀日本😀a", 0),
                 (Input::Key("\u{7f}", 51), "Aé😀日本😀", 0),
+                (Input::WindowKey("a", 0), "Aé😀日本😀a", 0),
+                (Input::WindowKey("\u{7f}", 51), "Aé😀日本😀", 0),
+                (Input::WindowKey("\u{f702}", 123), "Aé😀日本😀", 0),
+                (Input::Insert("!"), "Aé😀日本!😀", 0),
+                (Input::WindowKey("\u{f728}", 117), "Aé😀日本!", 0),
+                (Input::WindowKey("\u{7f}", 51), "Aé😀日本", 0),
             ];
             let mut values = Vec::new();
             // Wait for the real renderer/document before invoking the input client.
@@ -156,14 +172,35 @@ pub fn run(report: PathBuf) {
                 // This is outside App::update: AppKit's callback re-enters GPUI.
                 invoke(view, input, marked_length);
                 wait_for_value(&webview, &replies, expected, index + 1, cx).await;
+                assert_eq!(UNHANDLED_SELECTORS.load(Ordering::SeqCst), 0);
                 values.push(expected);
             }
             assert_hidden(app, view);
+            let key_events = window_key_events(&webview, &replies, cx).await;
+            assert_eq!(
+                key_events,
+                serde_json::json!([
+                    ["keydown", "a"],
+                    ["keyup", "a"],
+                    ["keydown", "Backspace"],
+                    ["keyup", "Backspace"],
+                    ["keydown", "ArrowLeft"],
+                    ["keyup", "ArrowLeft"],
+                    ["keydown", "Delete"],
+                    ["keyup", "Delete"],
+                    ["keydown", "Backspace"],
+                    ["keyup", "Backspace"],
+                ])
+            );
             std::fs::write(
                 &report,
                 serde_json::to_vec_pretty(&serde_json::json!({
                     "values": values, "visible": false, "activationPolicy": 2,
                     "syntheticNativeKeyEventPairs": 7,
+                    "syntheticWindowKeyEventPairs": 5,
+                    "windowKeyEvents": key_events,
+                    "unhandledSelectorObserverVerified": true,
+                    "unhandledSelectorCount": UNHANDLED_SELECTORS.load(Ordering::SeqCst),
                     "realKeyboardImeOrAudioVerified": false,
                 }))
                 .unwrap(),
@@ -174,6 +211,26 @@ pub fn run(report: PathBuf) {
         .detach();
     });
     runtime.shutdown();
+}
+
+fn observe_unhandled_selectors() {
+    // Instrument only this isolated test process. The observer suppresses the
+    // default alert while recording it; any invocation fails the scenario.
+    // This observes responder exhaustion, not every possible audio source.
+    unsafe extern "C-unwind" fn unhandled(_: &AnyObject, _: Sel, selector: Sel) {
+        eprintln!("unhandled AppKit selector: {selector:?}");
+        UNHANDLED_SELECTORS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe {
+        AnyClass::get(c"NSResponder")
+            .unwrap()
+            .instance_method(sel!(noResponderFor:))
+            .unwrap()
+            .set_implementation(std::mem::transmute::<
+                unsafe extern "C-unwind" fn(&AnyObject, Sel, Sel),
+                unsafe extern "C-unwind" fn(),
+            >(unhandled));
+    }
 }
 
 fn prohibit_activation() {
@@ -220,7 +277,10 @@ fn invoke(view: *mut AnyObject, input: Input, marked_length: usize) {
                 let _: () = msg_send![view, unmarkText];
             }
             Input::Key(characters, key_code) => {
-                send_native_key(view, characters, key_code);
+                send_native_key(view, characters, key_code, false);
+            }
+            Input::WindowKey(characters, key_code) => {
+                send_native_key(view, characters, key_code, true);
             }
         }
         let marked: ClientRange = msg_send![view, markedRange];
@@ -230,12 +290,22 @@ fn invoke(view: *mut AnyObject, input: Input, marked_length: usize) {
     }
 }
 
-unsafe fn send_native_key(view: *mut AnyObject, characters: &str, key_code: u16) {
+unsafe fn send_native_key(
+    view: *mut AnyObject,
+    characters: &str,
+    key_code: u16,
+    through_window: bool,
+) {
     // Construct NSEvents for this test window only. Never post them to NSApp,
     // the global event queue, or the user's active application.
     let characters = NSString::from_str(characters);
     unsafe {
         let window: *mut AnyObject = msg_send![view, window];
+        let responder: *mut AnyObject = msg_send![window, firstResponder];
+        assert_eq!(
+            responder, view,
+            "test view must be the window's first responder"
+        );
         let number: isize = msg_send![window, windowNumber];
         for event_type in [10usize, 11] {
             let event: *mut AnyObject = msg_send![
@@ -252,13 +322,40 @@ unsafe fn send_native_key(view: *mut AnyObject, characters: &str, key_code: u16)
                 keyCode: key_code
             ];
             assert!(!event.is_null());
-            // Dispatch only to this view's actual GPUI key-event implementation.
-            if event_type == 10 {
+            // Dispatch to the owned window or directly to its GPUI view.
+            if through_window {
+                let _: () = msg_send![window, sendEvent: event];
+            } else if event_type == 10 {
                 let _: () = msg_send![view, keyDown: event];
             } else {
                 let _: () = msg_send![view, keyUp: event];
             }
         }
+    }
+}
+
+async fn window_key_events(
+    webview: &gpui::Entity<Webview>,
+    replies: &Rc<RefCell<Vec<String>>>,
+    cx: &mut gpui::AsyncApp,
+) -> serde_json::Value {
+    let script = gpui_cef::post_message_script(
+        "'window-keys:' + JSON.stringify(keyEvents.filter(e=>e[0]==='keydown'||e[0]==='keyup').slice(-10).map(e=>e.slice(0,2)))",
+    );
+    webview.update(cx, |webview, _| webview.eval(&script));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(events) = replies
+            .borrow()
+            .iter()
+            .find_map(|value| value.strip_prefix("window-keys:"))
+        {
+            return serde_json::from_str(events).unwrap();
+        }
+        assert!(Instant::now() < deadline, "missing window key-event report");
+        cx.background_executor()
+            .timer(Duration::from_millis(30))
+            .await;
     }
 }
 

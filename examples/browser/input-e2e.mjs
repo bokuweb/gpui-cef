@@ -43,8 +43,19 @@ try {
     "Aé😀日本😀!語", "Aé😀日本😀!語", "Aé😀日本😀!語消", "Aé😀日本😀!語",
     "Aé😀日本😀!", "Aé😀日本😀!", "Aé😀日本😀?!", "Aé😀日本😀?",
     "Aé😀日本😀", "Aé😀日本", "Aé😀日本😀", "Aé😀日本😀a", "Aé😀日本😀",
+    "Aé😀日本😀a", "Aé😀日本😀", "Aé😀日本😀", "Aé😀日本!😀", "Aé😀日本!", "Aé😀日本",
   ]);
   assert.equal(result.syntheticNativeKeyEventPairs, 7);
+  assert.equal(result.syntheticWindowKeyEventPairs, 5);
+  assert.deepEqual(result.windowKeyEvents, [
+    ["keydown", "a"], ["keyup", "a"],
+    ["keydown", "Backspace"], ["keyup", "Backspace"],
+    ["keydown", "ArrowLeft"], ["keyup", "ArrowLeft"],
+    ["keydown", "Delete"], ["keyup", "Delete"],
+    ["keydown", "Backspace"], ["keyup", "Backspace"],
+  ]);
+  assert.equal(result.unhandledSelectorObserverVerified, true);
+  assert.equal(result.unhandledSelectorCount, 0);
   assert.equal(result.realKeyboardImeOrAudioVerified, false);
   console.log(JSON.stringify(result, null, 2));
 } finally {

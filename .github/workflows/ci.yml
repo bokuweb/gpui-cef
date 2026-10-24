@@ -57,6 +57,13 @@ jobs:
       - name: Build the .app bundle
         run: cargo run -p xtask
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check isolated AppKit and window input
+        run: node examples/browser/input-e2e.mjs
+
   windows:
     name: Windows (WebView2 backend)
     runs-on: windows-latest
