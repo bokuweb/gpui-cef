@@ -61,6 +61,39 @@ impl Webview {
     pub fn stop(&self) {}
     /// Runs JavaScript in the page (no-op).
     pub fn eval(&self, _script: &str) {}
+    /// Answers a JavaScript dialog. There never is one: always `false`.
+    pub fn resolve_dialog(
+        &self,
+        _id: crate::DialogId,
+        _accept: bool,
+        _text: Option<String>,
+    ) -> bool {
+        false
+    }
+    /// Answers a file chooser. There never is one: always `false`.
+    pub fn resolve_file_dialog(
+        &self,
+        _id: crate::FileDialogId,
+        _paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        false
+    }
+    /// Answers a download. There never is one: always `false`.
+    pub fn resolve_download(
+        &self,
+        _id: crate::DownloadId,
+        _path: Option<std::path::PathBuf>,
+    ) -> bool {
+        false
+    }
+    /// Printing needs a browser, which this platform does not have.
+    pub fn print_to_pdf(
+        &self,
+        _path: impl Into<std::path::PathBuf>,
+        _options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported("printing to PDF"))
+    }
     /// The current page title. Always empty.
     pub fn title(&self) -> String {
         String::new()

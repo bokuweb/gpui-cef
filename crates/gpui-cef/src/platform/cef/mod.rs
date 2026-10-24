@@ -16,6 +16,7 @@ mod handlers;
 mod ime;
 mod input;
 mod nsapp;
+mod pending;
 mod pump;
 mod shared;
 
@@ -281,7 +282,7 @@ impl Webview {
             ..Default::default()
         };
 
-        let mut client = handlers::GpuiCefClient::build(shared.clone());
+        let mut client = handlers::GpuiCefClient::build(shared.clone(), &options);
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
@@ -400,6 +401,68 @@ impl Webview {
         }
     }
 
+    /// Answers a [`crate::WebviewEvent::JsDialog`]. `accept` is OK as opposed
+    /// to Cancel; `text` is what a `prompt()` returns when accepted.
+    ///
+    /// Returns `false` when the dialog is no longer waiting: answered already,
+    /// or dismissed because the page navigated away.
+    pub fn resolve_dialog(&self, id: crate::DialogId, accept: bool, text: Option<String>) -> bool {
+        self.shared.resolve_js_dialog(id, accept, text.as_deref())
+    }
+
+    /// Answers a [`crate::WebviewEvent::FileDialog`] with the chosen paths, or
+    /// cancels it with `None` (or no paths).
+    ///
+    /// Returns `false` when it is no longer waiting.
+    pub fn resolve_file_dialog(
+        &self,
+        id: crate::FileDialogId,
+        paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        self.shared.resolve_file_dialog(id, paths.as_deref())
+    }
+
+    /// Answers a [`crate::WebviewEvent::DownloadRequested`]: the full path to
+    /// write the file to, including its name, or `None` to cancel. The
+    /// download waits until this is called; one still waiting when the
+    /// webview is dropped is cancelled.
+    ///
+    /// Returns `false` when it is not waiting for an answer.
+    pub fn resolve_download(
+        &self,
+        id: crate::DownloadId,
+        path: Option<std::path::PathBuf>,
+    ) -> bool {
+        self.shared.resolve_download(id, path.as_deref())
+    }
+
+    /// Prints the page to a PDF file at `path`, and emits
+    /// [`crate::WebviewEvent::PdfPrinted`] when it is done.
+    ///
+    /// This is the way for the application to print a windowless browser.
+    /// `window.print()` in the page still works after a fashion — CEF puts the
+    /// system print panel up as a window of its own, not attached to the gpui
+    /// window, and the page's script waits until it is closed — but the
+    /// application has no say in it. A page that should print through the
+    /// application can post it a message instead.
+    pub fn print_to_pdf(
+        &self,
+        path: impl Into<std::path::PathBuf>,
+        options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        let host = self
+            .host()
+            .ok_or_else(|| Error::Backend("the browser was never created".into()))?;
+        let path = path.into();
+        let mut callback = handlers::GpuiCefPdfPrintCallback::new(self.shared.clone());
+        host.print_to_pdf(
+            Some(&path.to_string_lossy().as_ref().into()),
+            Some(&handlers::pdf_settings(options)),
+            Some(&mut callback),
+        );
+        Ok(())
+    }
+
     fn host(&self) -> Option<BrowserHost> {
         self.browser.as_ref().and_then(|b| b.host())
     }
@@ -468,9 +531,13 @@ impl Webview {
 
 impl Drop for Webview {
     fn drop(&mut self) {
+        // Before the browser closes, so nothing the page asked for is left
+        // waiting on an application that is no longer listening.
+        self.shared.close();
         if let Some(host) = self.host() {
             host.close_browser(1);
         }
+        self.shared.take_browser();
     }
 }
 

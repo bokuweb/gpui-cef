@@ -11,8 +11,15 @@ use std::{
     sync::Arc,
 };
 
-use cef::{Browser, BrowserHost, ImplBrowser};
+use cef::{
+    BeforeDownloadCallback, Browser, BrowserHost, CefString, CefStringList, DownloadItemCallback,
+    FileDialogCallback, ImplBeforeDownloadCallback, ImplBrowser, ImplDownloadItemCallback,
+    ImplFileDialogCallback, ImplJsdialogCallback, JsdialogCallback,
+};
 use gpui::{px, size, Bounds, CursorStyle, Pixels, RenderImage, Size};
+
+use super::pending::{Abort, Cancel, Downloads, Pending, Proceed};
+use crate::{DialogId, DownloadId, DownloadState, FileDialogId, WebviewEvent};
 
 /// The most recent frame handed over by CEF.
 pub(crate) enum Frame {
@@ -93,8 +100,69 @@ pub(crate) struct Shared {
     /// The browser, kept here so the message pump can reach `BrowserHost`
     /// without borrowing gpui's `App`.
     browser: RefCell<Option<Browser>>,
-    /// Messages the page posted, waiting for the pump to emit them.
-    messages: RefCell<Vec<String>>,
+    /// Events waiting for the pump to emit them. CEF's callbacks run inside
+    /// `do_message_loop_work()`, where gpui cannot be reached, so they queue
+    /// here instead.
+    events: RefCell<Vec<WebviewEvent>>,
+    /// JavaScript dialogs waiting for `Webview::resolve_dialog`.
+    js_dialogs: Pending<JsDialogReply>,
+    /// File choosers waiting for `Webview::resolve_file_dialog`.
+    file_dialogs: Pending<FileDialogReply>,
+    /// Downloads, from the question of where they go until they finish.
+    downloads: Downloads<BeforeDownloadCallback, DownloadItemCallback>,
+    /// Set once the webview is gone. Anything the page asks for after that is
+    /// turned down on the spot, since nobody is left to answer.
+    closed: Cell<bool>,
+}
+
+/// The answer a JavaScript dialog is waiting for.
+pub(crate) struct JsDialogReply(pub(crate) JsdialogCallback);
+
+impl JsDialogReply {
+    fn answer(self, accept: bool, text: Option<&str>) {
+        let text = text.map(CefString::from);
+        self.0.cont(accept.into(), text.as_ref());
+    }
+}
+
+impl Cancel for JsDialogReply {
+    fn cancel(self) {
+        self.answer(false, None);
+    }
+}
+
+/// The choice a file chooser is waiting for.
+pub(crate) struct FileDialogReply(pub(crate) FileDialogCallback);
+
+impl FileDialogReply {
+    fn answer(self, paths: &[std::path::PathBuf]) {
+        // CEF reads an empty list as a cancellation.
+        let mut list = CefStringList::new();
+        for path in paths {
+            list.append(&path.to_string_lossy());
+        }
+        self.0.cont(Some(&mut list));
+    }
+}
+
+impl Cancel for FileDialogReply {
+    fn cancel(self) {
+        self.0.cancel();
+    }
+}
+
+impl Proceed for BeforeDownloadCallback {
+    fn proceed(self, path: &std::path::Path) {
+        let path = CefString::from(path.to_string_lossy().as_ref());
+        // No "Save As" dialog: the application already chose.
+        self.cont(Some(&path), 0);
+    }
+}
+
+impl Abort for DownloadItemCallback {
+    fn abort(&self) {
+        self.cancel();
+    }
 }
 
 impl Shared {
@@ -120,19 +188,129 @@ impl Shared {
             composition_bounds: RefCell::new(Vec::new()),
             received_frame: Cell::new(false),
             browser: RefCell::new(None),
-            messages: RefCell::new(Vec::new()),
+            events: RefCell::new(Vec::new()),
+            js_dialogs: Pending::default(),
+            file_dialogs: Pending::default(),
+            downloads: Downloads::default(),
+            closed: Cell::new(false),
         })
     }
 
-    /// Queue a message the page posted; the pump emits it on its next pass.
-    pub(crate) fn push_message(&self, message: String) {
-        self.messages.borrow_mut().push(message);
-        self.dirty.set(true);
+    /// Whether the webview has gone; see [`Shared::close`].
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
-    /// The messages posted since the last call.
-    pub(crate) fn take_messages(&self) -> Vec<String> {
-        std::mem::take(&mut *self.messages.borrow_mut())
+    /// The webview is gone: cancel everything still waiting on it, and turn
+    /// down whatever the page asks for from now on.
+    pub(crate) fn close(&self) {
+        self.closed.set(true);
+        self.js_dialogs.cancel_all();
+        self.file_dialogs.cancel_all();
+        self.downloads.cancel_waiting();
+    }
+
+    /// Keeps a JavaScript dialog until the application answers it.
+    pub(crate) fn add_js_dialog(&self, reply: JsDialogReply) -> DialogId {
+        DialogId(self.js_dialogs.insert(reply))
+    }
+
+    /// Answers a JavaScript dialog. `false` when it is no longer waiting.
+    pub(crate) fn resolve_js_dialog(&self, id: DialogId, accept: bool, text: Option<&str>) -> bool {
+        // Taken out before answering: CEF may call straight back in.
+        let Some(reply) = self.js_dialogs.take(id.0) else {
+            return false;
+        };
+        reply.answer(accept, text);
+        true
+    }
+
+    /// Keeps a file chooser until the application answers it.
+    pub(crate) fn add_file_dialog(&self, reply: FileDialogReply) -> FileDialogId {
+        FileDialogId(self.file_dialogs.insert(reply))
+    }
+
+    /// Answers a file chooser; `None` or no paths cancels it. `false` when it
+    /// is no longer waiting.
+    pub(crate) fn resolve_file_dialog(
+        &self,
+        id: FileDialogId,
+        paths: Option<&[std::path::PathBuf]>,
+    ) -> bool {
+        let Some(reply) = self.file_dialogs.take(id.0) else {
+            return false;
+        };
+        match paths {
+            Some(paths) if !paths.is_empty() => reply.answer(paths),
+            _ => reply.cancel(),
+        }
+        true
+    }
+
+    /// CEF asks where a download goes. Turned down at once when the webview
+    /// is gone; otherwise kept for the application, which is told. Returns
+    /// whether it was kept.
+    pub(crate) fn add_download(&self, id: u32, decision: BeforeDownloadCallback) -> bool {
+        if self.is_closed() {
+            // Dropping the question unanswered is CEF's cancel.
+            drop(decision);
+            self.downloads.reject(id.into());
+            return false;
+        }
+        self.downloads.request(id.into(), decision);
+        true
+    }
+
+    /// CEF reports a download's progress. Returns whether the application
+    /// should hear about it.
+    pub(crate) fn update_download(
+        &self,
+        id: u32,
+        control: DownloadItemCallback,
+        finished: bool,
+    ) -> bool {
+        self.downloads.update(id.into(), control, finished)
+    }
+
+    /// Where a download goes, or `None` to cancel it. `false` when it is not
+    /// waiting for an answer.
+    pub(crate) fn resolve_download(&self, id: DownloadId, path: Option<&std::path::Path>) -> bool {
+        self.downloads.resolve(id.0, path)
+    }
+
+    /// Dismisses every JavaScript dialog still waiting — the page navigated
+    /// away, say, and they no longer mean anything.
+    pub(crate) fn cancel_js_dialogs(&self) {
+        self.js_dialogs.cancel_all();
+    }
+
+    /// Queue an event for the application; the pump emits it on its next pass.
+    ///
+    /// CEF reports a download's progress many times a second, so an update
+    /// replaces one for the same download still waiting in the queue rather
+    /// than piling up behind it.
+    pub(crate) fn push_event(&self, event: WebviewEvent) {
+        self.dirty.set(true);
+        let mut events = self.events.borrow_mut();
+        if let WebviewEvent::DownloadUpdated { id, .. } = &event {
+            let queued = events.iter_mut().rev().find(|queued| {
+                matches!(queued, WebviewEvent::DownloadUpdated {
+                    id: queued,
+                    state: DownloadState::InProgress,
+                    ..
+                } if queued == id)
+            });
+            if let Some(queued) = queued {
+                *queued = event;
+                return;
+            }
+        }
+        events.push(event);
+    }
+
+    /// The events queued since the last call, oldest first.
+    pub(crate) fn take_events(&self) -> Vec<WebviewEvent> {
+        std::mem::take(&mut *self.events.borrow_mut())
     }
 
     /// Called from gpui's prepaint. Raises `resized` when the size changed.
@@ -157,6 +335,13 @@ impl Shared {
 
     pub(crate) fn set_browser(&self, browser: Browser) {
         *self.browser.borrow_mut() = Some(browser);
+    }
+
+    /// Lets go of the browser once the webview is gone. The browser holds the
+    /// client, whose handlers hold this, so keeping it would keep all three
+    /// alive for good.
+    pub(crate) fn take_browser(&self) -> Option<Browser> {
+        self.browser.borrow_mut().take()
     }
 
     pub(crate) fn host(&self) -> Option<BrowserHost> {
@@ -450,6 +635,52 @@ mod tests {
         assert!(shared.can_go_back());
         assert!(!shared.can_go_forward());
         assert!(shared.take_dirty());
+    }
+
+    #[test]
+    fn events_come_out_once_and_in_order() {
+        let shared = Shared::new("about:blank".into());
+        shared.take_dirty();
+
+        shared.push_event(WebviewEvent::Message("first".into()));
+        shared.push_event(WebviewEvent::Message("second".into()));
+        // The pump only looks at a view that says something changed.
+        assert!(shared.take_dirty());
+        assert_eq!(
+            shared.take_events(),
+            [
+                WebviewEvent::Message("first".into()),
+                WebviewEvent::Message("second".into())
+            ]
+        );
+        assert!(shared.take_events().is_empty());
+    }
+
+    #[test]
+    fn download_progress_collapses_while_it_waits_in_the_queue() {
+        let shared = Shared::new("about:blank".into());
+        let update = |id, state, received_bytes| WebviewEvent::DownloadUpdated {
+            id: DownloadId(id),
+            state,
+            received_bytes,
+            total_bytes: Some(100),
+            path: None,
+        };
+        shared.push_event(update(1, DownloadState::InProgress, 10));
+        shared.push_event(update(2, DownloadState::InProgress, 5));
+        shared.push_event(update(1, DownloadState::InProgress, 20));
+        shared.push_event(update(1, DownloadState::Completed, 100));
+        // Nothing replaces the end of a download.
+        shared.push_event(update(1, DownloadState::InProgress, 0));
+
+        assert_eq!(
+            shared.take_events(),
+            [
+                update(1, DownloadState::Completed, 100),
+                update(2, DownloadState::InProgress, 5),
+                update(1, DownloadState::InProgress, 0),
+            ]
+        );
     }
 
     #[test]

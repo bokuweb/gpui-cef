@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gpui-cef feature test page</title>
+<style>
+  :root { color-scheme: light; font: 14px/1.45 -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { margin: 0; padding: 20px 24px 40px; background: #f6f6f8; color: #1c1c22; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 16px; color: #5a5a66; }
+  section { background: #fff; border: 1px solid #dedee6; border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; }
+  h2 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, .button { font: inherit; padding: 4px 10px; border: 1px solid #b9b9c6; border-radius: 6px; background: #fff; color: inherit; cursor: pointer; text-decoration: none; }
+  button:hover, .button:hover { background: #eef0ff; }
+  .note { color: #5a5a66; font-size: 12px; margin-top: 6px; }
+  #results { font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; background: #1c1c22; color: #e8e8ec; border-radius: 8px; padding: 10px 12px; min-height: 60px; }
+  iframe { display: none; }
+</style>
+</head>
+<body>
+<h1>gpui-cef feature test page</h1>
+<p class="lead">Each button exercises one thing a windowless browser cannot do on its own. What the page saw is listed at the bottom; what the application saw is in the side panel.</p>
+
+<section id="popups">
+  <h2>Popups</h2>
+  <div class="row">
+    <button id="window-open">window.open()</button>
+    <a id="blank-link" class="button" href="https://example.org/" target="_blank" rel="noopener">target=_blank rel=noopener</a>
+  </div>
+  <div class="note">Blocked by default and reported as PopupRequested; the demo opens the URL in the system browser.</div>
+</section>
+
+<section id="navigation">
+  <h2>Navigation filter</h2>
+  <div class="row">
+    <a id="blocked-link" class="button" href="https://blocked.example/">Go to blocked.example</a>
+  </div>
+  <div class="note">The demo's filter turns down blocked.example, so the page stays here and NavigationBlocked is reported.</div>
+</section>
+
+<section id="dialogs">
+  <h2>JavaScript dialogs</h2>
+  <div class="row">
+    <button id="alert">alert()</button>
+    <button id="confirm">confirm()</button>
+    <button id="confirm-declined">confirm() to decline</button>
+    <button id="prompt">prompt()</button>
+    <label><input id="beforeunload" type="checkbox"> Ask before leaving (beforeunload)</label>
+    <button id="reload-from-app">Reload from the app</button>
+  </div>
+  <div class="note">Answered with native gpui prompts. Tick the box, then reload or navigate to see the "leave this page?" dialog.</div>
+</section>
+
+<section id="files">
+  <h2>File chooser</h2>
+  <div class="row">
+    <label>One file <input id="file-one" type="file"></label>
+    <label>Several, text or images <input id="file-many" type="file" multiple accept=".txt,image/*"></label>
+    <label>A folder <input id="file-folder" type="file" webkitdirectory></label>
+    <button id="save-picker">showSaveFilePicker()</button>
+  </div>
+</section>
+
+<section id="downloads">
+  <h2>Downloads</h2>
+  <div class="row">
+    <button id="download-blob">Download a blob the page built</button>
+    <a id="download-data" class="button" href="data:text/plain;charset=utf-8,Hello%20from%20a%20data%20URL%0A" download="from-data-url.txt">Download a data: URL</a>
+    <a id="download-declined" class="button" href="data:text/plain;charset=utf-8,Nobody%20wants%20this%0A" download="decline-me.txt">Download to decline</a>
+  </div>
+  <div class="note">The demo asks where to save with a native save panel; cancelling it cancels the download.</div>
+</section>
+
+<section id="crash">
+  <h2>Renderer crash and load errors</h2>
+  <div class="row">
+    <button id="crash-renderer">Crash the renderer</button>
+    <button id="load-error">Load a frame that does not resolve</button>
+  </div>
+  <div class="note">After a crash the demo shows a banner with Reload. A failed load is reported as LoadFailed.</div>
+</section>
+
+<section id="printing">
+  <h2>Printing</h2>
+  <div class="row">
+    <button id="print-pdf">Print to PDF (asks the app)</button>
+    <button id="window-print">window.print()</button>
+  </div>
+  <div class="note">window.print() opens the system print panel as a window of its own, not attached to the app's window, and the page waits until it is closed. Printing to PDF is the path the application controls.</div>
+</section>
+
+<h2>What the page saw</h2>
+<div id="results"></div>
+
+<script>
+  const MESSAGE_PREFIX = "__GPUI_CEF_MESSAGE_PREFIX__";
+  const results = document.getElementById("results");
+  const report = (line) => {
+    results.textContent += line + "\n";
+  };
+  // A message for the application, through the console bridge
+  // (gpui_cef::post_message_script does the same).
+  const post = (message) => console.debug(MESSAGE_PREFIX + message);
+  const on = (id, event, handler) => document.getElementById(id).addEventListener(event, handler);
+
+  on("window-open", "click", () => {
+    const opened = window.open("https://example.com/");
+    report("window.open returned " + (opened === null ? "null" : "a window"));
+  });
+  on("blank-link", "click", () => report("clicked the target=_blank link"));
+  on("blocked-link", "click", () => report("clicked the blocked.example link"));
+
+  on("alert", "click", () => {
+    alert("Hello from the page");
+    report("alert returned");
+  });
+  on("confirm", "click", () => report("confirm returned " + confirm("Do you confirm?")));
+  on("confirm-declined", "click", () => report("declined confirm returned " + confirm("Please decline this one")));
+  on("prompt", "click", () => report("prompt returned " + JSON.stringify(prompt("Your name?", "Ada"))));
+  const askBeforeLeaving = (event) => {
+    event.preventDefault();
+    event.returnValue = "";
+  };
+  on("beforeunload", "change", (event) => {
+    if (event.target.checked) {
+      window.addEventListener("beforeunload", askBeforeLeaving);
+    } else {
+      window.removeEventListener("beforeunload", askBeforeLeaving);
+    }
+    report("beforeunload " + (event.target.checked ? "on" : "off"));
+  });
+  on("reload-from-app", "click", () => post("reload"));
+
+  const describeFiles = async (input) => {
+    const files = [...input.files];
+    if (files.length === 0) {
+      report(input.id + ": nothing chosen");
+      return;
+    }
+    const names = files.map((file) => file.webkitRelativePath || file.name);
+    let first = "";
+    if (files[0].type.startsWith("text/") || files[0].name.endsWith(".txt")) {
+      first = " (first one says " + JSON.stringify((await files[0].text()).trim()) + ")";
+    }
+    report(input.id + ": " + names.join(", ") + first);
+  };
+  for (const id of ["file-one", "file-many", "file-folder"]) {
+    on(id, "change", (event) => describeFiles(event.target));
+    on(id, "cancel", () => report(id + ": cancelled"));
+  }
+  on("save-picker", "click", async () => {
+    if (!window.showSaveFilePicker) {
+      report("showSaveFilePicker is not available here");
+      return;
+    }
+    try {
+      const handle = await window.showSaveFilePicker({ suggestedName: "from-the-page.txt" });
+      const writable = await handle.createWritable();
+      await writable.write("Written through showSaveFilePicker\n");
+      await writable.close();
+      report("save picker: wrote " + handle.name);
+    } catch (error) {
+      report("save picker: " + error.name);
+    }
+  });
+
+  on("download-blob", "click", () => {
+    const blob = new Blob(["Hello from a blob the page built\n"], { type: "text/plain" });
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = "from-blob.txt";
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 60000);
+    report("started a blob download");
+  });
+  on("download-data", "click", () => report("started a data: URL download"));
+  on("download-declined", "click", () => report("started a download to decline"));
+
+  on("crash-renderer", "click", () => post("crash"));
+  on("load-error", "click", () => {
+    const frame = document.createElement("iframe");
+    frame.src = "http://does-not-exist.invalid/";
+    document.body.appendChild(frame);
+    report("loading a frame from does-not-exist.invalid");
+  });
+
+  on("print-pdf", "click", () => post("print-pdf"));
+  on("window-print", "click", () => {
+    window.print();
+    report("window.print returned");
+  });
+
+  report("loaded at " + new Date().toLocaleTimeString());
+</script>
+</body>
+</html>

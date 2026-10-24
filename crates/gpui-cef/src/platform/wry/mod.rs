@@ -17,19 +17,23 @@
 
 use std::{
     cell::{Cell, RefCell},
+    path::PathBuf,
     rc::Rc,
 };
 
 use gpui::{
-    div, prelude::*, App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
-    LayoutId, Pixels, Render, Style, Window,
+    div, prelude::*, App, AsyncApp, Bounds, Context, Element, ElementId, GlobalElementId,
+    InspectorElementId, LayoutId, Pixels, Render, Style, WeakEntity, Window,
 };
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
-    PageLoadEvent, Rect, WebView, WebViewBuilder,
+    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
 
-use crate::{Error, RuntimeOptions, WebviewOptions};
+use crate::{
+    DownloadId, DownloadState, Error, NavigationRequest, PopupPolicy, RuntimeOptions, WebviewEvent,
+    WebviewOptions,
+};
 
 /// The WebView2 runtime needs no process-wide setup, so [`Runtime`] holds
 /// nothing. It exists to match the macOS API.
@@ -67,17 +71,17 @@ pub struct Webview {
     url: String,
     /// Whether a page is loading, updated from wry's page load callback.
     is_loading: Rc<Cell<bool>>,
-    /// Messages that arrived while gpui was busy, emitted on the next render.
-    inbox: Rc<RefCell<Vec<String>>>,
 }
 
 impl Webview {
     /// Creates the webview and starts loading the first page.
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: WebviewOptions) -> Self {
         let is_loading = Rc::new(Cell::new(true));
-        let inbox: Rc<RefCell<Vec<String>>> = Rc::default();
-        let entity = cx.weak_entity();
-        let app = cx.to_async();
+        let downloads = Rc::new(DownloadIds::default());
+        let mailbox = Mailbox {
+            entity: cx.weak_entity(),
+            app: cx.to_async(),
+        };
 
         let builder = WebViewBuilder::new()
             .with_url(&options.url)
@@ -86,19 +90,70 @@ impl Webview {
             // prefixed lines to wry's IPC channel instead.
             .with_initialization_script(console_bridge_script())
             .with_ipc_handler({
-                let inbox = inbox.clone();
-                move |request| {
-                    let message = request.body().clone();
-                    // WebView2 calls back from the message loop, where gpui is
-                    // normally not mid-update; when it is, the message waits for
-                    // the next render.
-                    let mut app = app.clone();
-                    let emitted = entity.update(&mut app, |_, cx| {
-                        cx.emit(crate::WebviewEvent::Message(message.clone()));
-                    });
-                    if emitted.is_err() {
-                        inbox.borrow_mut().push(message);
+                let mailbox = mailbox.clone();
+                move |request| mailbox.emit(WebviewEvent::Message(request.body().clone()))
+            })
+            // Never let WebView2 open a window of its own; see PopupPolicy.
+            .with_new_window_req_handler({
+                let mailbox = mailbox.clone();
+                let policy = options.popups;
+                move |url, _features| {
+                    match policy {
+                        PopupPolicy::Block => mailbox.emit(WebviewEvent::PopupRequested {
+                            url,
+                            target_frame: String::new(),
+                            user_gesture: false,
+                        }),
+                        PopupPolicy::LoadInPlace if !url.is_empty() => {
+                            mailbox.post(move |this, _| this.load_url(&url))
+                        }
+                        PopupPolicy::LoadInPlace => {}
                     }
+                    NewWindowResponse::Deny
+                }
+            })
+            .with_download_started_handler({
+                let mailbox = mailbox.clone();
+                let downloads = downloads.clone();
+                move |url, path| {
+                    let id = downloads.start(&url);
+                    mailbox.emit(WebviewEvent::DownloadRequested {
+                        id,
+                        suggested_name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        url,
+                        mime_type: String::new(),
+                        total_bytes: None,
+                    });
+                    // WebView2 wants the answer now, so the download goes to
+                    // the folder it picked; the event is a notice.
+                    true
+                }
+            })
+            .with_download_completed_handler({
+                let mailbox = mailbox.clone();
+                let downloads = downloads.clone();
+                move |url, path, success| {
+                    let Some(id) = downloads.finish(&url) else {
+                        return;
+                    };
+                    let size = path
+                        .as_deref()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .map(|metadata| metadata.len());
+                    mailbox.emit(WebviewEvent::DownloadUpdated {
+                        id,
+                        state: if success {
+                            DownloadState::Completed
+                        } else {
+                            DownloadState::Failed
+                        },
+                        received_bytes: size.unwrap_or(0),
+                        total_bytes: size,
+                        path,
+                    });
                 }
             })
             .with_on_page_load_handler({
@@ -116,6 +171,30 @@ impl Webview {
                 .into(),
             });
 
+        let builder = match options.navigation_filter.clone() {
+            Some(filter) => builder.with_navigation_handler({
+                let mailbox = mailbox.clone();
+                move |url| {
+                    // WebView2 only asks about the page, and wry passes on the
+                    // URL alone.
+                    let navigation = NavigationRequest {
+                        url,
+                        is_redirect: false,
+                        user_gesture: false,
+                        is_main_frame: true,
+                    };
+                    let allowed = crate::options::navigation_allowed(&filter, &navigation);
+                    if !allowed {
+                        mailbox.emit(WebviewEvent::NavigationBlocked {
+                            url: navigation.url,
+                        });
+                    }
+                    allowed
+                }
+            }),
+            None => builder,
+        };
+
         let webview = match builder.build_as_child(&window) {
             Ok(webview) => Some(webview),
             Err(err) => {
@@ -130,7 +209,6 @@ impl Webview {
             last_bounds: None,
             url: options.url,
             is_loading,
-            inbox,
         }
     }
 
@@ -171,6 +249,46 @@ impl Webview {
     /// Stops the current load.
     pub fn stop(&self) {
         self.eval("window.stop()");
+    }
+
+    /// WebView2 shows JavaScript dialogs itself and never emits
+    /// [`WebviewEvent::JsDialog`], so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_dialog(
+        &self,
+        _id: crate::DialogId,
+        _accept: bool,
+        _text: Option<String>,
+    ) -> bool {
+        false
+    }
+
+    /// WebView2 shows its own file chooser and never emits
+    /// [`WebviewEvent::FileDialog`], so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_file_dialog(
+        &self,
+        _id: crate::FileDialogId,
+        _paths: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
+        false
+    }
+
+    /// WebView2 decides where a download goes before
+    /// [`WebviewEvent::DownloadRequested`] is emitted — its default folder,
+    /// usually the user's Downloads — so there is nothing to answer: always
+    /// `false`.
+    pub fn resolve_download(&self, _id: DownloadId, _path: Option<PathBuf>) -> bool {
+        false
+    }
+
+    /// Not with WebView2 yet: wry does not reach its `PrintToPdf`.
+    pub fn print_to_pdf(
+        &self,
+        _path: impl Into<PathBuf>,
+        _options: &crate::PdfOptions,
+    ) -> crate::Result<()> {
+        Err(Error::Unsupported("printing to PDF with WebView2"))
     }
 
     /// Whether a page is currently loading.
@@ -240,6 +358,57 @@ impl Webview {
     }
 }
 
+/// Numbers WebView2's downloads. wry reports a download's start and its end
+/// by URL alone, so the two are matched up by URL, oldest first.
+#[derive(Default)]
+struct DownloadIds {
+    next: Cell<u64>,
+    running: RefCell<Vec<(String, u64)>>,
+}
+
+impl DownloadIds {
+    fn start(&self, url: &str) -> DownloadId {
+        let id = self.next.get() + 1;
+        self.next.set(id);
+        self.running.borrow_mut().push((url.to_string(), id));
+        DownloadId(id)
+    }
+
+    fn finish(&self, url: &str) -> Option<DownloadId> {
+        let mut running = self.running.borrow_mut();
+        let index = running.iter().position(|(running, _)| running == url)?;
+        Some(DownloadId(running.remove(index).1))
+    }
+}
+
+/// Hands what WebView2 reports over to the gpui entity.
+///
+/// WebView2 calls back from the window's message loop, and gpui may be partway
+/// through an update right then; updating the entity from inside the callback
+/// would trip over gpui's borrow of the app. So delivery goes through gpui's
+/// foreground executor, which runs it once nothing holds the app.
+#[derive(Clone)]
+struct Mailbox {
+    entity: WeakEntity<Webview>,
+    app: AsyncApp,
+}
+
+impl Mailbox {
+    /// Runs `apply` against the webview soon, unless it has gone away by then.
+    fn post(&self, apply: impl FnOnce(&mut Webview, &mut Context<Webview>) + 'static) {
+        let entity = self.entity.clone();
+        self.app
+            .spawn(async move |cx| {
+                let _ = entity.update(cx, apply);
+            })
+            .detach();
+    }
+
+    fn emit(&self, event: WebviewEvent) {
+        self.post(move |_, cx| cx.emit(event));
+    }
+}
+
 /// A script, run before each page's own, that forwards console lines carrying
 /// [`crate::MESSAGE_PREFIX`] to wry's IPC channel.
 fn console_bridge_script() -> String {
@@ -254,7 +423,7 @@ fn console_bridge_script() -> String {
     )
 }
 
-impl gpui::EventEmitter<crate::WebviewEvent> for Webview {}
+impl gpui::EventEmitter<WebviewEvent> for Webview {}
 
 impl gpui::Focusable for Webview {
     fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
@@ -264,9 +433,6 @@ impl gpui::Focusable for Webview {
 
 impl Render for Webview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for message in std::mem::take(&mut *self.inbox.borrow_mut()) {
-            cx.emit(crate::WebviewEvent::Message(message));
-        }
         div()
             .track_focus(&self.focus_handle)
             .size_full()

@@ -11,7 +11,13 @@ use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::{px, size, Bounds, CursorStyle, RenderImage};
 
-use super::shared::{Frame as SharedFrame, Shared};
+use super::shared::{FileDialogReply, Frame as SharedFrame, JsDialogReply, Shared};
+use crate::{
+    DialogPolicy, DownloadId, DownloadState, FileDialogMode as Mode, JsDialogKind,
+    NavigationRequest, PdfMargins, PdfOptions, PopupPolicy, WebviewEvent, WebviewOptions,
+};
+
+type Status = crate::TerminationStatus;
 
 /// Settings carried by `cef::App`.
 #[derive(Clone)]
@@ -277,7 +283,9 @@ wrap_display_handler! {
             };
             match crate::message_payload(&message) {
                 Some(payload) => {
-                    self.state.shared.push_message(payload.to_string());
+                    self.state
+                        .shared
+                        .push_event(crate::WebviewEvent::Message(payload.to_string()));
                     1
                 }
                 None => 0,
@@ -338,6 +346,674 @@ fn cursor_style(cursor: CursorType) -> CursorStyle {
     }
 }
 
+/// Picks up load progress and whether history navigation is possible.
+#[derive(Clone)]
+pub(crate) struct LoadState {
+    pub(crate) shared: Rc<Shared>,
+}
+
+wrap_load_handler! {
+    pub(crate) struct GpuiCefLoadHandler {
+        state: LoadState,
+    }
+
+    impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            is_loading: ::std::os::raw::c_int,
+            can_go_back: ::std::os::raw::c_int,
+            can_go_forward: ::std::os::raw::c_int,
+        ) {
+            self.state.shared.set_load_state(
+                is_loading != 0,
+                can_go_back != 0,
+                can_go_forward != 0,
+            );
+        }
+
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut cef::Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            // ERR_ABORTED just means another navigation replaced this one, or
+            // the navigation filter turned it down.
+            if error_code == Errorcode::ABORTED {
+                return;
+            }
+            let url = string(failed_url);
+            let error_text = string(error_text);
+            log::warn!("failed to load {url}: {error_text} ({error_code:?})");
+            self.state.shared.push_event(WebviewEvent::LoadFailed {
+                url,
+                error_code: *error_code.as_ref() as i32,
+                error_text,
+                is_main_frame: frame.is_none_or(|frame| frame.is_main() != 0),
+            });
+        }
+    }
+}
+
+/// What the handlers that act on the application's behalf — popups,
+/// navigation, dialogs, downloads — need: somewhere to queue events, and the
+/// policies the application chose.
+#[derive(Clone)]
+pub(crate) struct PageState {
+    pub(crate) shared: Rc<Shared>,
+    pub(crate) options: Rc<WebviewOptions>,
+}
+
+impl PageState {
+    /// A blocked popup becomes an event; one allowed in place becomes a
+    /// navigation of the main frame.
+    fn handle_popup(
+        &self,
+        browser: Option<&mut Browser>,
+        url: String,
+        target_frame: String,
+        user_gesture: bool,
+    ) {
+        match self.options.popups {
+            PopupPolicy::Block => self.shared.push_event(WebviewEvent::PopupRequested {
+                url,
+                target_frame,
+                user_gesture,
+            }),
+            PopupPolicy::LoadInPlace => {
+                // A bare window.open() has nowhere to go.
+                if url.is_empty() {
+                    return;
+                }
+                if let Some(frame) = browser.and_then(|browser| browser.main_frame()) {
+                    frame.load_url(Some(&url.as_str().into()));
+                }
+            }
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    pub(crate) struct GpuiCefLifeSpanHandler {
+        state: PageState,
+    }
+
+    impl LifeSpanHandler {
+        /// `window.open` and `target="_blank"` links. Always cancelled: Alloy
+        /// would otherwise create a native popup window the application has no
+        /// hold on. What happens instead is up to [`PopupPolicy`].
+        fn on_before_popup(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            self.state.handle_popup(
+                browser,
+                string(target_url),
+                string(target_frame_name),
+                user_gesture != 0,
+            );
+            1
+        }
+    }
+}
+
+wrap_request_handler! {
+    pub(crate) struct GpuiCefRequestHandler {
+        state: PageState,
+    }
+
+    impl RequestHandler {
+        /// Every navigation, of the page and of its frames, passes through
+        /// [`crate::WebviewOptions::navigation_filter`] here.
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut cef::Frame>,
+            request: Option<&mut Request>,
+            user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(filter) = &self.state.options.navigation_filter else {
+                return 0;
+            };
+            let navigation = NavigationRequest {
+                url: request
+                    .map(|request| CefString::from(&request.url()).to_string())
+                    .unwrap_or_default(),
+                is_redirect: is_redirect != 0,
+                user_gesture: user_gesture != 0,
+                is_main_frame: frame.is_none_or(|frame| frame.is_main() != 0),
+            };
+            if crate::options::navigation_allowed(filter, &navigation) {
+                return 0;
+            }
+            self.state
+                .shared
+                .push_event(WebviewEvent::NavigationBlocked { url: navigation.url });
+            // Cancelled; CEF reports ERR_ABORTED to the load handler, which
+            // leaves it out.
+            1
+        }
+
+        /// The renderer died. The page is frozen on its last frame until the
+        /// application reloads it, so it has to hear about this.
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            log::error!("the render process terminated: {status:?} ({error_code})");
+            // Nothing is left to answer them.
+            self.state.shared.cancel_js_dialogs();
+            self.state
+                .shared
+                .push_event(WebviewEvent::RenderProcessTerminated {
+                    status: termination_status(status),
+                    error_code,
+                    error_text: string(error_string),
+                });
+        }
+
+        /// A link the user asked to open somewhere else — Cmd-click or
+        /// middle-click. Left alone, Chromium would load it here; it goes
+        /// through [`PopupPolicy`] like any other new window instead.
+        fn on_open_urlfrom_tab(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            if !opens_new_window(target_disposition) {
+                return 0;
+            }
+            match self.state.options.popups {
+                // Letting it through loads it in this browser, which is the
+                // policy.
+                PopupPolicy::LoadInPlace => 0,
+                PopupPolicy::Block => {
+                    self.state
+                        .handle_popup(browser, string(target_url), String::new(), user_gesture != 0);
+                    1
+                }
+            }
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    pub(crate) struct GpuiCefJsDialogHandler {
+        state: PageState,
+    }
+
+    impl JsdialogHandler {
+        /// `alert`, `confirm` and `prompt`. A windowless browser has no dialog
+        /// of its own, so the application answers — see [`DialogPolicy`].
+        fn on_jsdialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            dialog_type: JsdialogType,
+            message_text: Option<&CefString>,
+            default_prompt_text: Option<&CefString>,
+            callback: Option<&mut JsdialogCallback>,
+            suppress_message: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(kind), Some(callback)) = (js_dialog_kind(dialog_type), callback) else {
+                return 0;
+            };
+            if self.state.options.js_dialogs == DialogPolicy::AutoDismiss
+                || self.state.shared.is_closed()
+            {
+                // Suppressing, which CEF prefers to answering at once: alert
+                // returns, confirm returns false and prompt null.
+                if let Some(suppress) = suppress_message {
+                    *suppress = 1;
+                }
+                return 0;
+            }
+            let id = self.state.shared.add_js_dialog(JsDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::JsDialog {
+                id,
+                kind,
+                message: string(message_text),
+                default_prompt: string(default_prompt_text),
+                origin_url: string(origin_url),
+            });
+            1
+        }
+
+        /// The "leave this page?" dialog a `beforeunload` handler asks for.
+        fn on_before_unload_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_text: Option<&CefString>,
+            is_reload: ::std::os::raw::c_int,
+            callback: Option<&mut JsdialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            if self.state.options.js_dialogs == DialogPolicy::AutoDismiss
+                || self.state.shared.is_closed()
+            {
+                // Leave: staying would make the navigation hang on a question
+                // nobody is going to answer.
+                callback.cont(1, None);
+                return 1;
+            }
+            let id = self.state.shared.add_js_dialog(JsDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::JsDialog {
+                id,
+                kind: JsDialogKind::BeforeUnload {
+                    is_reload: is_reload != 0,
+                },
+                message: string(message_text),
+                default_prompt: String::new(),
+                origin_url: String::new(),
+            });
+            1
+        }
+
+        /// The page moved on — navigated, say — so a dialog still waiting no
+        /// longer means anything.
+        fn on_reset_dialog_state(&self, _browser: Option<&mut Browser>) {
+            self.state.shared.cancel_js_dialogs();
+        }
+    }
+}
+
+wrap_dialog_handler! {
+    pub(crate) struct GpuiCefDialogHandler {
+        state: PageState,
+    }
+
+    impl DialogHandler {
+        /// `<input type="file">` and the file picker APIs. CEF's own picker
+        /// needs a window, so the application chooses instead.
+        fn on_file_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            mode: FileDialogMode,
+            title: Option<&CefString>,
+            default_file_path: Option<&CefString>,
+            accept_filters: Option<&mut CefStringList>,
+            accept_extensions: Option<&mut CefStringList>,
+            _accept_descriptions: Option<&mut CefStringList>,
+            callback: Option<&mut FileDialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            let (Some(mode), false) = (file_dialog_mode(mode), self.state.shared.is_closed())
+            else {
+                callback.cancel();
+                return 1;
+            };
+            let filters = string_list(accept_filters);
+            let extensions = accept_extensions_of(&filters, &string_list(accept_extensions));
+            let id = self.state.shared.add_file_dialog(FileDialogReply(callback.clone()));
+            self.state.shared.push_event(WebviewEvent::FileDialog {
+                id,
+                mode,
+                title: string(title),
+                default_path: Some(string(default_file_path))
+                    .filter(|path| !path.is_empty())
+                    .map(Into::into),
+                accept_filters: filters,
+                accept_extensions: extensions,
+            });
+            // Returning 1 keeps CEF from asking again or showing a picker of
+            // its own.
+            1
+        }
+    }
+}
+
+wrap_download_handler! {
+    pub(crate) struct GpuiCefDownloadHandler {
+        state: PageState,
+    }
+
+    impl DownloadHandler {
+        /// Lets every download through to `on_before_download`, which is
+        /// where the application decides. CEF's own default says yes too,
+        /// but a method left out of a cef-rs handler answers 0 — no.
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> ::std::os::raw::c_int {
+            1
+        }
+
+        /// A download is starting and CEF wants to know where it goes. The
+        /// application says, through `Webview::resolve_download`.
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return 0;
+            };
+            // CEF says not to keep the item, so read what is needed now.
+            let id = item.id();
+            if !self.state.shared.add_download(id, callback.clone()) {
+                return 1;
+            }
+            self.state.shared.push_event(WebviewEvent::DownloadRequested {
+                id: DownloadId(id.into()),
+                url: CefString::from(&item.url()).to_string(),
+                suggested_name: string(suggested_name),
+                mime_type: CefString::from(&item.mime_type()).to_string(),
+                total_bytes: byte_count(item.total_bytes()),
+            });
+            // Returning 1 means the callback will be called, later.
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return;
+            };
+            let state = download_state(
+                item.is_complete() != 0,
+                item.is_canceled() != 0,
+                item.is_interrupted() != 0,
+            );
+            let finished = matches!(state, DownloadState::Completed | DownloadState::Canceled);
+            let id = item.id();
+            if !self.state.shared.update_download(id, callback.clone(), finished) {
+                return;
+            }
+            let path = CefString::from(&item.full_path()).to_string();
+            self.state.shared.push_event(WebviewEvent::DownloadUpdated {
+                id: DownloadId(id.into()),
+                state,
+                received_bytes: byte_count(item.received_bytes()).unwrap_or(0),
+                total_bytes: byte_count(item.total_bytes()),
+                path: Some(path).filter(|path| !path.is_empty()).map(Into::into),
+            });
+        }
+    }
+}
+
+/// Where a download stands, from CEF's flags. An interrupted download may
+/// still resume, so it is not taken as finished.
+fn download_state(complete: bool, canceled: bool, interrupted: bool) -> DownloadState {
+    if complete {
+        DownloadState::Completed
+    } else if canceled {
+        DownloadState::Canceled
+    } else if interrupted {
+        DownloadState::Failed
+    } else {
+        DownloadState::InProgress
+    }
+}
+
+/// A byte count CEF reports, which is negative or zero when unknown.
+fn byte_count(bytes: i64) -> Option<u64> {
+    u64::try_from(bytes).ok().filter(|bytes| *bytes > 0)
+}
+
+fn file_dialog_mode(mode: FileDialogMode) -> Option<Mode> {
+    match mode {
+        FileDialogMode::OPEN => Some(Mode::Open),
+        FileDialogMode::OPEN_MULTIPLE => Some(Mode::OpenMultiple),
+        FileDialogMode::OPEN_FOLDER => Some(Mode::OpenFolder),
+        FileDialogMode::SAVE => Some(Mode::Save),
+        _ => None,
+    }
+}
+
+/// The file extensions an `accept` attribute allows, lower-case and without
+/// the dot. CEF lists the filters as written (`image/*`, `.DOCX`) and, beside
+/// each, the extensions a MIME type stands for (`.png;.jpg`), or nothing when
+/// it does not know.
+fn accept_extensions_of(filters: &[String], expansions: &[String]) -> Vec<String> {
+    let mut extensions: Vec<String> = Vec::new();
+    for (index, filter) in filters.iter().enumerate() {
+        let expansion = expansions
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let candidates = if expansion.is_empty() && filter.starts_with('.') {
+            filter.as_str()
+        } else {
+            expansion
+        };
+        for extension in candidates.split(';') {
+            let extension = extension.trim().trim_start_matches('.').to_lowercase();
+            if !extension.is_empty() && !extensions.contains(&extension) {
+                extensions.push(extension);
+            }
+        }
+    }
+    extensions
+}
+
+/// The strings in a list CEF passed to a callback. It still owns the list.
+fn string_list(list: Option<&mut CefStringList>) -> Vec<String> {
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    let raw: *mut cef::sys::_cef_string_list_t = list.into();
+    if raw.is_null() {
+        return Vec::new();
+    }
+    let count = unsafe { cef::sys::cef_string_list_size(raw) };
+    (0..count)
+        .filter_map(|index| unsafe {
+            let mut value: cef::sys::cef_string_t = std::mem::zeroed();
+            if cef::sys::cef_string_list_value(raw, index, &mut value) == 0 {
+                return None;
+            }
+            let text = CefString::from(std::ptr::from_ref(&value)).to_string();
+            // The list hands out a copy, which is ours to free.
+            cef::sys::cef_string_utf16_clear(&mut value);
+            Some(text)
+        })
+        .collect()
+}
+
+fn js_dialog_kind(dialog_type: JsdialogType) -> Option<JsDialogKind> {
+    match dialog_type {
+        JsdialogType::ALERT => Some(JsDialogKind::Alert),
+        JsdialogType::CONFIRM => Some(JsDialogKind::Confirm),
+        JsdialogType::PROMPT => Some(JsDialogKind::Prompt),
+        _ => None,
+    }
+}
+
+wrap_pdf_print_callback! {
+    pub(crate) struct GpuiCefPdfPrintCallback {
+        shared: Rc<Shared>,
+    }
+
+    impl PdfPrintCallback {
+        fn on_pdf_print_finished(&self, path: Option<&CefString>, ok: ::std::os::raw::c_int) {
+            self.shared.push_event(WebviewEvent::PdfPrinted {
+                path: string(path).into(),
+                ok: ok != 0,
+            });
+        }
+    }
+}
+
+/// [`PdfOptions`] in CEF's shape. Sizes are in inches on both sides.
+pub(crate) fn pdf_settings(options: &PdfOptions) -> PdfPrintSettings {
+    let (width, height) = options.paper_size.unwrap_or_default();
+    let (margin_type, [top, right, bottom, left]) = match options.margins {
+        PdfMargins::Default => (PdfPrintMarginType::DEFAULT, [0.; 4]),
+        PdfMargins::None => (PdfPrintMarginType::NONE, [0.; 4]),
+        PdfMargins::Custom {
+            top,
+            right,
+            bottom,
+            left,
+        } => (PdfPrintMarginType::CUSTOM, [top, right, bottom, left]),
+    };
+    let mut settings = PdfPrintSettings {
+        landscape: options.landscape.into(),
+        print_background: options.print_background.into(),
+        // Zero means "the default", for the paper as for the scale.
+        paper_width: width,
+        paper_height: height,
+        prefer_css_page_size: options.prefer_css_page_size.into(),
+        margin_type,
+        margin_top: top,
+        margin_right: right,
+        margin_bottom: bottom,
+        margin_left: left,
+        ..Default::default()
+    };
+    if let Some(ranges) = &options.page_ranges {
+        settings.page_ranges = ranges.as_str().into();
+    }
+    settings
+}
+
+fn termination_status(status: TerminationStatus) -> Status {
+    match status {
+        TerminationStatus::PROCESS_WAS_KILLED => Status::Killed,
+        TerminationStatus::PROCESS_CRASHED => Status::Crashed,
+        TerminationStatus::PROCESS_OOM => Status::OutOfMemory,
+        TerminationStatus::LAUNCH_FAILED => Status::LaunchFailed,
+        TerminationStatus::INTEGRITY_FAILURE => Status::IntegrityFailure,
+        _ => Status::Abnormal,
+    }
+}
+
+/// Whether a navigation was meant for a new tab or window rather than this
+/// one.
+fn opens_new_window(disposition: WindowOpenDisposition) -> bool {
+    !matches!(
+        disposition,
+        WindowOpenDisposition::CURRENT_TAB
+            | WindowOpenDisposition::SAVE_TO_DISK
+            | WindowOpenDisposition::IGNORE_ACTION
+            | WindowOpenDisposition::UNKNOWN
+    )
+}
+
+/// An optional CEF string as an owned one, empty when CEF passed none.
+fn string(value: Option<&CefString>) -> String {
+    value.map(ToString::to_string).unwrap_or_default()
+}
+
+/// The handlers that act on the application's behalf, built from one
+/// [`PageState`].
+#[derive(Clone)]
+pub(crate) struct PageHandlers {
+    life_span: LifeSpanHandler,
+    request: RequestHandler,
+    js_dialog: JsdialogHandler,
+    dialog: DialogHandler,
+    download: DownloadHandler,
+}
+
+impl PageHandlers {
+    fn new(page: PageState) -> Self {
+        Self {
+            life_span: GpuiCefLifeSpanHandler::new(page.clone()),
+            request: GpuiCefRequestHandler::new(page.clone()),
+            js_dialog: GpuiCefJsDialogHandler::new(page.clone()),
+            dialog: GpuiCefDialogHandler::new(page.clone()),
+            download: GpuiCefDownloadHandler::new(page),
+        }
+    }
+}
+
+wrap_client! {
+    pub(crate) struct GpuiCefClient {
+        render_handler: RenderHandler,
+        display_handler: DisplayHandler,
+        load_handler: LoadHandler,
+        page: PageHandlers,
+    }
+
+    impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> {
+            Some(self.render_handler.clone())
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display_handler.clone())
+        }
+
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(self.load_handler.clone())
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(self.page.life_span.clone())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.page.request.clone())
+        }
+
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(self.page.js_dialog.clone())
+        }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.page.dialog.clone())
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(self.page.download.clone())
+        }
+    }
+}
+
+impl GpuiCefClient {
+    pub(crate) fn build(shared: Rc<Shared>, options: &WebviewOptions) -> Client {
+        let page = PageState {
+            shared: shared.clone(),
+            options: Rc::new(options.clone()),
+        };
+        Self::new(
+            GpuiCefRenderHandler::new(RenderState {
+                shared: shared.clone(),
+            }),
+            GpuiCefDisplayHandler::new(DisplayState {
+                shared: shared.clone(),
+            }),
+            GpuiCefLoadHandler::new(LoadState { shared }),
+            PageHandlers::new(page),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,88 +1044,114 @@ mod tests {
             cursor_style(CursorType::SOUTHRESIZE)
         );
     }
-}
 
-/// Picks up load progress and whether history navigation is possible.
-#[derive(Clone)]
-pub(crate) struct LoadState {
-    pub(crate) shared: Rc<Shared>,
-}
-
-wrap_load_handler! {
-    pub(crate) struct GpuiCefLoadHandler {
-        state: LoadState,
+    #[test]
+    fn javascript_dialogs_map_to_their_kinds() {
+        assert_eq!(
+            js_dialog_kind(JsdialogType::ALERT),
+            Some(JsDialogKind::Alert)
+        );
+        assert_eq!(
+            js_dialog_kind(JsdialogType::CONFIRM),
+            Some(JsDialogKind::Confirm)
+        );
+        assert_eq!(
+            js_dialog_kind(JsdialogType::PROMPT),
+            Some(JsDialogKind::Prompt)
+        );
     }
 
-    impl LoadHandler {
-        fn on_loading_state_change(
-            &self,
-            _browser: Option<&mut Browser>,
-            is_loading: ::std::os::raw::c_int,
-            can_go_back: ::std::os::raw::c_int,
-            can_go_forward: ::std::os::raw::c_int,
-        ) {
-            self.state.shared.set_load_state(
-                is_loading != 0,
-                can_go_back != 0,
-                can_go_forward != 0,
-            );
-        }
-
-        fn on_load_error(
-            &self,
-            _browser: Option<&mut Browser>,
-            _frame: Option<&mut cef::Frame>,
-            error_code: Errorcode,
-            error_text: Option<&CefString>,
-            failed_url: Option<&CefString>,
-        ) {
-            // ERR_ABORTED just means another navigation replaced this one.
-            if error_code == Errorcode::from(cef::sys::cef_errorcode_t::ERR_ABORTED) {
-                return;
-            }
-            log::warn!(
-                "failed to load {}: {} ({:?})",
-                failed_url.map(|url| url.to_string()).unwrap_or_default(),
-                error_text.map(|text| text.to_string()).unwrap_or_default(),
-                error_code,
-            );
-        }
-    }
-}
-
-wrap_client! {
-    pub(crate) struct GpuiCefClient {
-        render_handler: RenderHandler,
-        display_handler: DisplayHandler,
-        load_handler: LoadHandler,
+    #[test]
+    fn file_dialog_modes_map_across() {
+        assert_eq!(file_dialog_mode(FileDialogMode::OPEN), Some(Mode::Open));
+        assert_eq!(
+            file_dialog_mode(FileDialogMode::OPEN_MULTIPLE),
+            Some(Mode::OpenMultiple)
+        );
+        assert_eq!(
+            file_dialog_mode(FileDialogMode::OPEN_FOLDER),
+            Some(Mode::OpenFolder)
+        );
+        assert_eq!(file_dialog_mode(FileDialogMode::SAVE), Some(Mode::Save));
     }
 
-    impl Client {
-        fn render_handler(&self) -> Option<RenderHandler> {
-            Some(self.render_handler.clone())
-        }
-
-        fn display_handler(&self) -> Option<DisplayHandler> {
-            Some(self.display_handler.clone())
-        }
-
-        fn load_handler(&self) -> Option<LoadHandler> {
-            Some(self.load_handler.clone())
-        }
+    #[test]
+    fn accept_filters_become_extensions() {
+        let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A MIME type contributes what CEF expanded it to; an extension
+        // stands for itself even when CEF left its expansion empty.
+        assert_eq!(
+            accept_extensions_of(
+                &strings(&["image/*", ".DOCX", "application/x-unknown"]),
+                &strings(&[".png;.jpg; .JPG", "", ""])
+            ),
+            ["png", "jpg", "docx"]
+        );
+        // Repeats collapse, and no filters means no restriction.
+        assert_eq!(
+            accept_extensions_of(&strings(&[".txt", ".txt"]), &strings(&[".txt", ""])),
+            ["txt"]
+        );
+        assert!(accept_extensions_of(&[], &[]).is_empty());
     }
-}
 
-impl GpuiCefClient {
-    pub(crate) fn build(shared: Rc<Shared>) -> Client {
-        Self::new(
-            GpuiCefRenderHandler::new(RenderState {
-                shared: shared.clone(),
-            }),
-            GpuiCefDisplayHandler::new(DisplayState {
-                shared: shared.clone(),
-            }),
-            GpuiCefLoadHandler::new(LoadState { shared }),
-        )
+    #[test]
+    fn download_states_follow_cefs_flags() {
+        assert_eq!(
+            download_state(false, false, false),
+            DownloadState::InProgress
+        );
+        assert_eq!(download_state(true, false, false), DownloadState::Completed);
+        assert_eq!(download_state(false, true, false), DownloadState::Canceled);
+        assert_eq!(download_state(false, false, true), DownloadState::Failed);
+        // Cancelling interrupts too; cancelled is what it is.
+        assert_eq!(download_state(false, true, true), DownloadState::Canceled);
+    }
+
+    #[test]
+    fn unknown_sizes_are_none() {
+        assert_eq!(byte_count(1024), Some(1024));
+        assert_eq!(byte_count(0), None);
+        assert_eq!(byte_count(-1), None);
+    }
+
+    #[test]
+    fn termination_statuses_map_across() {
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_CRASHED),
+            Status::Crashed
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_WAS_KILLED),
+            Status::Killed
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::PROCESS_OOM),
+            Status::OutOfMemory
+        );
+        assert_eq!(
+            termination_status(TerminationStatus::ABNORMAL_TERMINATION),
+            Status::Abnormal
+        );
+    }
+
+    #[test]
+    fn only_new_tabs_and_windows_count_as_popups() {
+        for disposition in [
+            WindowOpenDisposition::NEW_FOREGROUND_TAB,
+            WindowOpenDisposition::NEW_BACKGROUND_TAB,
+            WindowOpenDisposition::NEW_POPUP,
+            WindowOpenDisposition::NEW_WINDOW,
+        ] {
+            assert!(opens_new_window(disposition), "{disposition:?}");
+        }
+        // Loading here, saving a link, and nothing at all are not windows.
+        for disposition in [
+            WindowOpenDisposition::CURRENT_TAB,
+            WindowOpenDisposition::SAVE_TO_DISK,
+            WindowOpenDisposition::IGNORE_ACTION,
+        ] {
+            assert!(!opens_new_window(disposition), "{disposition:?}");
+        }
     }
 }

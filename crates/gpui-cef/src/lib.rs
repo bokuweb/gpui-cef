@@ -36,28 +36,33 @@
 //!     runtime.shutdown();
 //! }
 //! ```
+//!
+//! # When the page needs the application
+//!
+//! A windowless browser has nowhere to show a dialog, a file picker or a popup
+//! of its own, so what the page asks for that needs one arrives as a
+//! [`WebviewEvent`] — subscribe with `cx.subscribe(&webview, ...)` — and is
+//! answered through the [`Webview`]: [`Webview::resolve_dialog`],
+//! [`Webview::resolve_file_dialog`], [`Webview::resolve_download`].
+//! [`WebviewOptions`] holds the policies for popups, navigation and dialogs.
 
 // The usage example above is deliberately a full `fn main`, since the ordering
 // around it is the whole point.
 #![allow(clippy::needless_doctest_main)]
 
+mod event;
 mod options;
 mod platform;
 
-pub use options::{CookieSpec, RuntimeOptions, SameSite, WebviewOptions};
+pub use event::{
+    DialogId, DownloadId, DownloadState, FileDialogId, FileDialogMode, JsDialogKind,
+    TerminationStatus, WebviewEvent,
+};
+pub use options::{
+    CookieSpec, DialogPolicy, NavigationFilter, NavigationRequest, PdfMargins, PdfOptions,
+    PopupPolicy, RuntimeOptions, SameSite, WebviewOptions,
+};
 pub use platform::{init, Runtime, Webview};
-
-/// What a [`Webview`] reports to the application, through
-/// [`gpui::EventEmitter`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WebviewEvent {
-    /// A message the page posted with the script [`post_message_script`]
-    /// returns.
-    ///
-    /// Untrusted: any script running in the page can post one, so treat it as
-    /// input from the page, not from the application.
-    Message(String),
-}
 
 /// What a console line starts with when it is a message for the application.
 /// The page never needs to spell it out: [`post_message_script`] does.
