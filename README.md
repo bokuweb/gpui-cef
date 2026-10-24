@@ -303,9 +303,15 @@ It invokes the native text-client callbacks and asserts the renderer's DOM
 values and UTF-16 marked ranges. It also sends synthetic typing, Backspace, Left and
 Delete NSEvents directly to its own view and checks typing, caret movement and
 deletion of complete surrogate pairs.
-It does not post system keyboard events, switch the system input source or
-verify real IME candidate UI, physical input latency or
-audio. A macOS WindowServer/Metal session is still required.
+Five additional key pairs go through the owned `NSWindow.sendEvent:` and its
+first responder, with exact DOM `keydown`/`keyup` pairs checked as well as the
+resulting text. A self-tested observer records `NSResponder.noResponderFor:`
+in this disposable process and fails on any unexpected invocation. It suppresses
+that method's default alert only in the test process; it does not change the
+library or prove the absence of all warning sounds. The hidden input test runs
+in macOS CI. It does not post system keyboard events or switch the system input
+source. Physical keyboard input, IME candidate UI, input latency and audio remain
+unverified. A macOS WindowServer/Metal session is still required.
 
 Anything that needs a live browser is exercised by running the demo instead.
 CEF's remote debugging port is open, so `http://127.0.0.1:9229/json/list` plus
