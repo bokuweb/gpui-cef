@@ -56,6 +56,8 @@ try {
   ]);
   assert.equal(result.unhandledSelectorObserverVerified, true);
   assert.equal(result.unhandledSelectorCount, 0);
+  assert.equal(result.nativeMenuReplayObserverVerified, true);
+  assert.equal(result.nativeMenuReplayCount, 0);
   assert.equal(result.inputEventsWellFormed, true);
   assert.equal(result.realKeyboardImeOrAudioVerified, false);
   console.log(JSON.stringify(result, null, 2));

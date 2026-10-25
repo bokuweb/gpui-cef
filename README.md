@@ -267,6 +267,12 @@ to editors even when a plain input's eventual value looks correct. Astral text
 is committed atomically, including when there is no active composition. The
 native input probe checks each DOM input event as well as the final value.
 
+GPUI owns the initial AppKit key and menu dispatch. After the renderer and
+JavaScript have had a chance to handle a key, the CEF keyboard handler consumes
+the remaining native fallback. Otherwise CEF sends even ordinary typing back
+through `NSMenu.performKeyEquivalent:`, repeating menu validation and actions.
+The existing focused-frame copy/cut/paste fallback still runs at this stage.
+
 ## Testing
 
 ```bash
@@ -311,7 +317,10 @@ first responder, with exact DOM `keydown`/`keyup` pairs checked as well as the
 resulting text. A self-tested observer records `NSResponder.noResponderFor:`
 in this disposable process and fails on any unexpected invocation. It suppresses
 that method's default alert only in the test process; it does not change the
-library or prove the absence of all warning sounds. The hidden input test runs
+library or prove the absence of all warning sounds. An additional self-tested
+`NSMenu.performKeyEquivalent:` observer preserves
+AppKit's implementation and rejects renderer fallback into the native menu.
+This checks replay behavior, not physical keyboard latency. The hidden test runs
 in macOS CI. It does not post system keyboard events or switch the system input
 source. Physical keyboard input, IME candidate UI, input latency and audio remain
 unverified. A macOS WindowServer/Metal session is still required.

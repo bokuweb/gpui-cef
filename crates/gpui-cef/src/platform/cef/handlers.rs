@@ -941,17 +941,23 @@ wrap_keyboard_handler! {
         ) -> i32 {
             use super::input::{clipboard_command, ClipboardCommand};
 
-            let Some(command) = event.and_then(clipboard_command) else {
+            let Some(event) = event else {
                 return 0;
             };
-            let Some(frame) = browser.and_then(|browser| browser.focused_frame()) else {
-                return 0;
-            };
-            match command {
-                ClipboardCommand::Copy => frame.copy(),
-                ClipboardCommand::Cut => frame.cut(),
-                ClipboardCommand::Paste => frame.paste(),
+            if let Some(command) = clipboard_command(event) {
+                if let Some(frame) = browser.and_then(|browser| browser.focused_frame()) {
+                    match command {
+                        ClipboardCommand::Copy => frame.copy(),
+                        ClipboardCommand::Cut => frame.cut(),
+                        ClipboardCommand::Paste => frame.paste(),
+                    }
+                }
             }
+            // OnKeyEvent runs after the renderer and JavaScript have had their
+            // chance. GPUI already owns AppKit's initial key/menu dispatch;
+            // returning false here sends even ordinary typing back through
+            // NSMenu.performKeyEquivalent, including menu validation/actions.
+            // Consume only this final native fallback, not the page's input.
             1
         }
     }
@@ -1099,6 +1105,56 @@ impl GpuiCefClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_keyboard_fallback_does_not_reenter_the_native_menu() {
+        let handler = GpuiCefKeyboardHandler::new();
+        // CEF invokes this callback after the renderer. Returning false here
+        // invokes NSMenu.performKeyEquivalent again, even for plain typing.
+        for key in [
+            0x41, 0x31, 0x08, 0x09, 0x0D, 0x1B, 0x25, 0x43, 0x58, 0x56, 0x53,
+        ] {
+            for type_ in [
+                KeyEventType::RAWKEYDOWN,
+                KeyEventType::KEYUP,
+                KeyEventType::CHAR,
+            ] {
+                for combination in 0..16 {
+                    let modifiers = [1 << 1, 1 << 2, 1 << 3, 1 << 7]
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| combination & (1 << index) != 0)
+                        .fold(0, |flags, (_, modifier)| flags | modifier);
+                    let event = KeyEvent {
+                        type_,
+                        modifiers,
+                        windows_key_code: key,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        handler.on_key_event(None, Some(&event), std::ptr::null_mut()),
+                        1,
+                        "CEF must not replay {type_:?}, key {key}, flags {modifiers} to AppKit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_fallback_leaves_the_renderer_first_chance_to_handle_input() {
+        let handler = GpuiCefKeyboardHandler::new();
+        let event = KeyEvent {
+            type_: KeyEventType::RAWKEYDOWN,
+            windows_key_code: 0x41,
+            ..Default::default()
+        };
+        assert_eq!(
+            handler.on_pre_key_event(None, Some(&event), std::ptr::null_mut(), None),
+            0
+        );
+        assert_eq!(handler.on_key_event(None, None, std::ptr::null_mut()), 0);
+    }
 
     #[test]
     fn clipboard_permissions_deny_by_default_and_only_accept_the_approved_origin() {

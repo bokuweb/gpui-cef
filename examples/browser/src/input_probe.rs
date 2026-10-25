@@ -13,7 +13,10 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -26,6 +29,9 @@ enum Input {
 }
 
 static UNHANDLED_SELECTORS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_MENU_REPLAYS: AtomicUsize = AtomicUsize::new(0);
+type MenuKeyEquivalent = unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject) -> Bool;
+static ORIGINAL_MENU_KEY_EQUIVALENT: OnceLock<MenuKeyEquivalent> = OnceLock::new();
 
 // GPUI registers its legacy NSRange spelling, while objc2-foundation uses
 // _NSRange. Match the actual client's encoding as well as its C layout.
@@ -90,6 +96,7 @@ pub fn run(report: PathBuf) {
         let app: *mut AnyObject =
             unsafe { msg_send![AnyClass::get(c"NSApplication").unwrap(), sharedApplication] };
         let _: Bool = unsafe { msg_send![app, setActivationPolicy: 2isize] };
+        observe_native_menu_replays(app);
         cef.start(cx).unwrap();
         let handle = cx
             .open_window(
@@ -177,6 +184,11 @@ pub fn run(report: PathBuf) {
                 invoke(view, input, marked_length);
                 wait_for_value(&webview, &replies, expected, index + 1, cx).await;
                 assert_eq!(UNHANDLED_SELECTORS.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    NATIVE_MENU_REPLAYS.load(Ordering::SeqCst),
+                    0,
+                    "renderer keyboard fallback must not reenter AppKit's menu"
+                );
                 values.push(expected);
             }
             assert_hidden(app, view);
@@ -215,6 +227,8 @@ pub fn run(report: PathBuf) {
                     "inputEventsWellFormed": true,
                     "unhandledSelectorObserverVerified": true,
                     "unhandledSelectorCount": UNHANDLED_SELECTORS.load(Ordering::SeqCst),
+                    "nativeMenuReplayObserverVerified": true,
+                    "nativeMenuReplayCount": NATIVE_MENU_REPLAYS.load(Ordering::SeqCst),
                     "realKeyboardImeOrAudioVerified": false,
                 }))
                 .unwrap(),
@@ -225,6 +239,48 @@ pub fn run(report: PathBuf) {
         .detach();
     });
     runtime.shutdown();
+}
+
+fn observe_native_menu_replays(app: *mut AnyObject) {
+    // Preserve the actual AppKit implementation. Only this disposable process
+    // is instrumented, and input is sent directly to its window/view, bypassing
+    // NSApp's initial menu dispatch. Any later menu call is a CEF replay.
+    unsafe extern "C-unwind" fn observe(
+        this: &AnyObject,
+        selector: Sel,
+        event: *mut AnyObject,
+    ) -> Bool {
+        NATIVE_MENU_REPLAYS.fetch_add(1, Ordering::SeqCst);
+        unsafe { ORIGINAL_MENU_KEY_EQUIVALENT.get().unwrap()(this, selector, event) }
+    }
+    unsafe {
+        let class = AnyClass::get(c"NSMenu").unwrap();
+        let original = class
+            .instance_method(sel!(performKeyEquivalent:))
+            .unwrap()
+            .set_implementation(std::mem::transmute::<
+                MenuKeyEquivalent,
+                unsafe extern "C-unwind" fn(),
+            >(observe));
+        ORIGINAL_MENU_KEY_EQUIVALENT
+            .set(std::mem::transmute::<
+                unsafe extern "C-unwind" fn(),
+                MenuKeyEquivalent,
+            >(original))
+            .unwrap();
+        let menu: *mut AnyObject = msg_send![class, new];
+        let _: () = msg_send![app, setMainMenu: menu];
+        let characters = NSString::from_str("a");
+        let event: *mut AnyObject = msg_send![AnyClass::get(c"NSEvent").unwrap(),
+            keyEventWithType: 10usize, location: NSPoint::new(0., 0.), modifierFlags: 0usize,
+            timestamp: 0f64, windowNumber: 0isize, context: std::ptr::null_mut::<AnyObject>(),
+            characters: &*characters, charactersIgnoringModifiers: &*characters,
+            isARepeat: Bool::NO, keyCode: 0u16];
+        assert!(!event.is_null());
+        let _: Bool = msg_send![menu, performKeyEquivalent: event];
+        assert_eq!(NATIVE_MENU_REPLAYS.swap(0, Ordering::SeqCst), 1);
+        let _: () = msg_send![menu, release];
+    }
 }
 
 fn observe_unhandled_selectors() {
