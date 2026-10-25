@@ -142,8 +142,17 @@ pub fn run(report: PathBuf) {
         assert_eq!(UNHANDLED_SELECTORS.swap(0, Ordering::SeqCst), 1);
         let replies = Rc::new(RefCell::new(Vec::<String>::new()));
         let received = replies.clone();
+        // Timestamp in the callback, not after an executor polling delay.
+        let round_trips = Rc::new(RefCell::new((None::<Instant>, Vec::<f64>::new())));
+        let measured = round_trips.clone();
         cx.subscribe(&webview, move |_, event: &WebviewEvent, _| {
             if let WebviewEvent::Message(message) = event {
+                if message.starts_with("pump-round-trip:") {
+                    let mut measured = measured.borrow_mut();
+                    if let Some(started) = measured.0.take() {
+                        measured.1.push(started.elapsed().as_secs_f64() * 1000.);
+                    }
+                }
                 received.borrow_mut().push(message.clone());
             }
         })
@@ -217,6 +226,19 @@ pub fn run(report: PathBuf) {
                 "individual input events must preserve Unicode scalars: {}",
                 key_events["input"]
             );
+            // A controlled host -> renderer -> host IPC benchmark. It excludes
+            // real keyboard/IME, document layout and display presentation.
+            for index in 0..110 {
+                round_trips.borrow_mut().0 = Some(Instant::now());
+                let script = gpui_cef::post_message_script(&format!("'pump-round-trip:{index}'"));
+                webview.update(cx, |webview, _| webview.eval(&script));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while round_trips.borrow().0.is_some() {
+                    assert!(Instant::now() < deadline, "missing pump benchmark reply");
+                    cx.background_executor().timer(Duration::from_millis(2)).await;
+                }
+            }
+            let round_trip_ms = &round_trips.borrow().1[10..];
             std::fs::write(
                 &report,
                 serde_json::to_vec_pretty(&serde_json::json!({
@@ -230,6 +252,8 @@ pub fn run(report: PathBuf) {
                     "nativeMenuReplayObserverVerified": true,
                     "nativeMenuReplayCount": NATIVE_MENU_REPLAYS.load(Ordering::SeqCst),
                     "realKeyboardImeOrAudioVerified": false,
+                    "hostRendererRoundTripMs": round_trip_ms,
+                    "roundTripScope": "eval to native message callback; 10 warmups excluded; no document or display measurement",
                 }))
                 .unwrap(),
             )

@@ -80,10 +80,11 @@ wrap_browser_process_handler! {
         /// With `external_message_pump` enabled, CEF uses this to say when it
         /// would like `do_message_loop_work()` to be called.
         ///
-        /// Nothing to do here: [`super::pump`] drives the loop from a 60Hz timer
-        /// on the main run loop, so the call happens within 16ms regardless.
-        /// Calling more often than requested only costs a little efficiency.
-        fn on_schedule_message_pump_work(&self, _delay_ms: i64) {}
+        /// Marshal requests from any CEF thread to the main run-loop timer.
+        /// This never calls CEF synchronously or borrows GPUI's App.
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            super::pump::schedule_work(delay_ms);
+        }
     }
 }
 

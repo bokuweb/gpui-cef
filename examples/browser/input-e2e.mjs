@@ -60,6 +60,10 @@ try {
   assert.equal(result.nativeMenuReplayCount, 0);
   assert.equal(result.inputEventsWellFormed, true);
   assert.equal(result.realKeyboardImeOrAudioVerified, false);
+  assert.equal(result.hostRendererRoundTripMs.length, 100);
+  assert.ok(result.hostRendererRoundTripMs.every(value => Number.isFinite(value) && value >= 0));
+  const sorted = [...result.hostRendererRoundTripMs].sort((a, b) => a - b);
+  result.roundTripSummaryMs = { median: sorted[49], p95: sorted[94], max: sorted[99] };
   console.log(JSON.stringify(result, null, 2));
 } finally {
   // Only this test's process group and temporary bundle can be removed.

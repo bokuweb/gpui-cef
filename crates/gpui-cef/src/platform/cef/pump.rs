@@ -23,7 +23,9 @@
 //! # One timer for the whole process
 //!
 //! `do_message_loop_work()` drives all of CEF, not one browser, so there is a
-//! single timer per process and webviews register with it. A timer per webview
+//! single timer per process and webviews register with it. CEF's scheduling
+//! callback signals a thread-safe run-loop source to bring that timer forward;
+//! idle/accelerated rendering retains the 60Hz fallback. A timer per webview
 //! would pump CEF once per webview per tick, which is pure waste as soon as an
 //! app shows more than one.
 
@@ -31,11 +33,18 @@ use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     rc::Rc,
+    sync::atomic::{AtomicPtr, Ordering},
+    time::{Duration, Instant},
 };
 
 use core_foundation::{
+    base::{kCFAllocatorDefault, TCFType},
     date::CFAbsoluteTimeGetCurrent,
-    runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext},
+    runloop::{
+        kCFRunLoopCommonModes, CFRunLoop, CFRunLoopAddSource, CFRunLoopGetMain,
+        CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal,
+        CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerSetNextFireDate, CFRunLoopWakeUp,
+    },
 };
 use gpui::{AsyncApp, WeakEntity};
 
@@ -43,6 +52,72 @@ use super::{shared::Shared, Webview};
 
 /// How often to drive CEF, in seconds. Roughly 60fps.
 const INTERVAL: f64 = 1. / 60.;
+
+#[derive(Default)]
+struct PendingWork {
+    deadline: Option<Instant>,
+}
+
+impl PendingWork {
+    fn request(&mut self, now: Instant, delay_ms: i64) {
+        // The fallback is 60Hz, so a longer request never needs a later wakeup.
+        // Clamp before adding to Instant, including CEF's i64::MAX sentinel.
+        self.deadline = Some(now + Duration::from_millis(delay_ms.clamp(0, 17) as u64));
+    }
+
+    fn take_deadline(&mut self, fallback: Instant) -> Option<Instant> {
+        self.deadline.take().map(|deadline| deadline.min(fallback))
+    }
+}
+
+static REQUESTED_WORK: parking_lot::Mutex<PendingWork> =
+    parking_lot::Mutex::new(PendingWork { deadline: None });
+
+// This source owns its create-rule retain for the process lifetime. Its context
+// contains no GPUI or thread-local pointers. Signalling a CFRunLoopSource and
+// waking its run loop are safe from CEF's arbitrary callback threads.
+static WAKE_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+pub(crate) fn schedule_work(delay_ms: i64) {
+    REQUESTED_WORK.lock().request(Instant::now(), delay_ms);
+    signal_wake_source();
+}
+
+fn signal_wake_source() {
+    let source = WAKE_SOURCE.load(Ordering::Acquire);
+    if !source.is_null() {
+        unsafe {
+            CFRunLoopSourceSignal(source as CFRunLoopSourceRef);
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+    }
+}
+
+// Only adjusts the main-thread timer. Never execute CEF inside the scheduling
+// callback: a request can originate while application code has borrowed GPUI.
+extern "C" fn on_schedule(_info: *const c_void) {
+    let _ = PUMP.try_with(|slot| {
+        let Ok(slot) = slot.try_borrow() else {
+            signal_wake_source();
+            return;
+        };
+        let Some(pump) = slot.as_ref() else {
+            return;
+        };
+        let fallback = pump.state.last_tick.get() + Duration::from_secs_f64(INTERVAL);
+        if let Some(deadline) = REQUESTED_WORK.lock().take_deadline(fallback) {
+            let delay = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
+            unsafe {
+                CFRunLoopTimerSetNextFireDate(
+                    pump._timer.as_concrete_TypeRef(),
+                    CFAbsoluteTimeGetCurrent() + delay,
+                );
+            }
+        }
+    });
+}
 
 thread_local! {
     /// The one timer, created on first use and left running for the life of the
@@ -61,10 +136,52 @@ struct View {
     cx: AsyncApp,
 }
 
-#[derive(Default)]
 struct PumpState {
+    last_tick: Cell<Instant>,
+    last_begin_frame: Cell<Instant>,
+    pumping: Cell<bool>,
+    deferred: Cell<bool>,
     next_id: Cell<u64>,
     views: RefCell<Vec<View>>,
+}
+
+impl PumpState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_tick: Cell::new(now),
+            last_begin_frame: Cell::new(now),
+            pumping: Cell::new(false),
+            deferred: Cell::new(false),
+            next_id: Cell::new(0),
+            views: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn begin_tick(&self) -> bool {
+        if self.pumping.replace(true) {
+            self.deferred.set(true);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn finish_tick(&self) -> bool {
+        self.pumping.set(false);
+        self.deferred.replace(false)
+    }
+
+    fn take_begin_frame(&self, now: Instant) -> bool {
+        if now
+            .duration_since(self.last_begin_frame.get())
+            .as_secs_f64()
+            < INTERVAL
+        {
+            return false;
+        }
+        self.last_begin_frame.set(now);
+        true
+    }
 }
 
 struct Pump {
@@ -123,7 +240,7 @@ pub(crate) fn register(
 
 impl Pump {
     fn start() -> Self {
-        let state = Rc::new(PumpState::default());
+        let state = Rc::new(PumpState::new(Instant::now()));
 
         let mut context = CFRunLoopTimerContext {
             version: 0,
@@ -140,6 +257,27 @@ impl Pump {
             CFRunLoop::get_main().add_timer(&timer, kCFRunLoopCommonModes);
         }
 
+        let mut source_context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: on_schedule,
+        };
+        unsafe {
+            let source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &mut source_context);
+            assert!(!source.is_null());
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+            WAKE_SOURCE.store(source as *mut c_void, Ordering::Release);
+        }
+        // CEF can request work during initialization, before the first view.
+        signal_wake_source();
+
         Self {
             _timer: timer,
             state,
@@ -152,6 +290,22 @@ extern "C" fn on_tick(_timer: core_foundation::runloop::CFRunLoopTimerRef, info:
         return;
     }
     let state = unsafe { &*(info as *const PumpState) };
+    if !state.begin_tick() {
+        return;
+    }
+    struct ActiveTick<'a>(&'a PumpState);
+    impl Drop for ActiveTick<'_> {
+        fn drop(&mut self) {
+            if self.0.finish_tick() {
+                schedule_work(0);
+            }
+        }
+    }
+    let _active = ActiveTick(state);
+    state.last_tick.set(Instant::now());
+    unsafe {
+        CFRunLoopTimerSetNextFireDate(_timer, CFAbsoluteTimeGetCurrent() + INTERVAL);
+    }
 
     // Driving CEF here, with gpui's App unborrowed, is the whole point. Calling
     // this while the App is borrowed lets gpui's paint re-enter from the run
@@ -165,12 +319,15 @@ extern "C" fn on_tick(_timer: core_foundation::runloop::CFRunLoopTimerRef, info:
         Err(_) => return,
     };
 
+    // Urgent IPC/input work may pump much faster than the display cadence.
+    // Do not turn those wakeups into extra accelerated frame requests.
+    let begin_frame = state.take_begin_frame(Instant::now());
     for view in views {
-        tick_view(&view);
+        tick_view(&view, begin_frame);
     }
 }
 
-fn tick_view(view: &View) {
+fn tick_view(view: &View, begin_frame: bool) {
     if view.shared.take_resized() {
         if let Some(host) = view.shared.host() {
             use cef::ImplBrowserHost as _;
@@ -178,7 +335,7 @@ fn tick_view(view: &View) {
         }
     }
 
-    if view.accelerated {
+    if view.accelerated && begin_frame {
         // With external_begin_frame_enabled, this is what makes CEF draw a frame.
         if let Some(host) = view.shared.host() {
             use cef::ImplBrowserHost as _;
@@ -206,4 +363,81 @@ fn tick_view(view: &View) {
             cx.notify();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cef::ImplBrowserProcessHandler;
+    use proptest::prelude::*;
+
+    #[test]
+    fn cef_schedule_callback_accepts_requests_from_another_thread() {
+        REQUESTED_WORK.lock().deadline = None;
+        let before = Instant::now();
+        std::thread::spawn(|| {
+            super::super::handlers::GpuiCefBrowserProcessHandler::new()
+                .on_schedule_message_pump_work(0);
+        })
+        .join()
+        .unwrap();
+        let deadline = REQUESTED_WORK
+            .lock()
+            .take_deadline(before + Duration::from_secs(1));
+        assert!(
+            deadline.is_some(),
+            "CEF's immediate work request must not be ignored"
+        );
+        assert!(deadline.unwrap() <= Instant::now());
+    }
+
+    #[test]
+    fn nested_ticks_defer_work_until_the_active_tick_finishes() {
+        let state = PumpState::new(Instant::now());
+        assert!(state.begin_tick());
+        assert!(!state.begin_tick());
+        assert!(!state.begin_tick());
+        assert!(state.finish_tick());
+        assert!(state.begin_tick());
+        assert!(!state.finish_tick());
+    }
+
+    #[test]
+    fn urgent_work_does_not_multiply_accelerated_frames() {
+        let now = Instant::now();
+        let state = PumpState::new(now);
+        let mut frames = 0;
+        for ms in 0..100 {
+            frames += usize::from(state.take_begin_frame(now + Duration::from_millis(ms)));
+        }
+        assert_eq!(frames, 5);
+        assert!(!state.take_begin_frame(now + Duration::from_millis(99)));
+        assert!(state.take_begin_frame(now + Duration::from_millis(102)));
+    }
+
+    #[test]
+    fn later_request_replaces_timer_but_cannot_postpone_fallback() {
+        let now = Instant::now();
+        let fallback = now + Duration::from_secs_f64(INTERVAL);
+        let mut pending = PendingWork::default();
+        pending.request(now, 1);
+        pending.request(now, i64::MAX);
+        assert_eq!(pending.take_deadline(fallback), Some(fallback));
+        assert_eq!(pending.take_deadline(fallback), None);
+        pending.request(now, i64::MIN);
+        assert_eq!(pending.take_deadline(fallback), Some(now));
+    }
+
+    proptest! {
+        #[test]
+        fn burst_requests_follow_the_last_deadline(delays in prop::collection::vec(any::<i64>(), 1..256)) {
+            let now = Instant::now();
+            let fallback = now + Duration::from_secs_f64(INTERVAL);
+            let mut pending = PendingWork::default();
+            for delay in &delays { pending.request(now, *delay); }
+            let expected = (now + Duration::from_millis((*delays.last().unwrap()).clamp(0, 17) as u64)).min(fallback);
+            prop_assert_eq!(pending.take_deadline(fallback), Some(expected));
+            prop_assert_eq!(pending.take_deadline(fallback), None);
+        }
+    }
 }
