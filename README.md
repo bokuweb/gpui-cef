@@ -454,3 +454,10 @@ xtask/                  assembles the .app bundle
   screenshot could capture the window. That the page renders at exactly the
   element's rect was confirmed over CDP instead (994x786 inside a 1280x860
   window, matching the layout to the pixel).
+
+## License
+
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option, as declared by the workspace's Cargo
+metadata. Dependencies, including the bundled browser engine, retain their own
+licenses.
