@@ -407,7 +407,15 @@ repaint, so the executor does not run.
 
 Fix: bypass gpui and install a `CFRunLoopTimer` on the main run loop at 60Hz
 (`platform/cef/pump.rs`). The callback comes straight from the run loop, so nobody
-is borrowing gpui's `App`.
+is borrowing gpui's `App`. CEF's `on_schedule_message_pump_work` callback
+signals a thread-safe run-loop source that brings this timer forward for pending
+work. Only the timer calls CEF, with recursive ticks deferred until it returns.
+The 60Hz fallback remains active without scheduling requests, and accelerated
+begin-frame requests retain their own 60Hz limit.
+
+`just input-e2e` also reports 100 host/renderer IPC round trips, after 10 warmups.
+See [message-pump measurements](docs/message-pump-performance.md) for the method
+and baseline. This measures neither physical typing nor document/display latency.
 
 ### The child process sandbox
 
