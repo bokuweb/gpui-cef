@@ -279,14 +279,14 @@ wrap_display_handler! {
             _source: Option<&CefString>,
             _line: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-            let Some(message) = message.map(|message| message.to_string()) else {
+            let Some(message) = message.and_then(CefString::as_slice) else {
                 return 0;
             };
-            match crate::message_payload(&message) {
+            match crate::message::message_payload_utf16(message) {
                 Some(payload) => {
                     self.state
                         .shared
-                        .push_event(crate::WebviewEvent::Message(payload.to_string()));
+                        .push_event(crate::WebviewEvent::Message(payload));
                     1
                 }
                 None => 0,
