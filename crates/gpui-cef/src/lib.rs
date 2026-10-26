@@ -51,6 +51,8 @@
 #![allow(clippy::needless_doctest_main)]
 
 mod event;
+#[cfg(any(target_os = "macos", test))]
+mod message;
 mod options;
 mod platform;
 
