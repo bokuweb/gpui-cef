@@ -31,3 +31,18 @@ reports median/p95 for 1 KiB and 11 MiB mostly-ASCII messages containing
 Japanese text and an emoji. Allocation and destruction are included. These
 are conversion measurements, not whole save or typing latency measurements;
 whole-application behavior must be measured separately.
+
+On an Apple Silicon Mac with CEF 151.3.24, the 11 MiB case measured
+18.606/20.257 ms median/p95 before and 13.140/14.497 ms after. The 1 KiB
+case rounded to 0.001 ms for both. This is one local run and includes
+scheduling and allocator variance.
+
+A separate release GPUI/CEF save comparison in jade-elsa alternated two
+processes per implementation with the same local core WASM and SDK 0.0.53
+JavaScript. Each process saved eight times and checked the complete body and
+PNG bytes. Using only saves without DevTools console observation, excluding
+two warmups per process, there were six measured samples per implementation.
+Save medians were 128.753 ms before and 126.268 ms after; ranges were
+111.185–139.250 and 117.695–131.970 ms. This small end-to-end difference is
+inconclusive; the evidence supports reduced conversion cost and copying,
+not a claim about perceptible save or typing speed.
